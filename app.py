@@ -199,6 +199,29 @@ def api_delete_server(sid):
     save_config(cfg)
     return jsonify({"ok": True})
 
+
+@app.route("/api/servers/<sid>", methods=["PUT"])
+def api_edit_server(sid):
+    cfg = load_config()
+    data = request.json
+    auth_mode = data.get("auth_mode", "key")
+    for s in cfg["servers"]:
+        if s["id"] == sid:
+            s["name"]      = data["name"]
+            s["host"]      = data["host"]
+            s["port"]      = data.get("port", 22)
+            s["user"]      = data.get("user", "root")
+            s["auth_mode"] = auth_mode
+            s["key"]       = data.get("key", "") if auth_mode == "key" else ""
+            new_pw = data.get("password", "")
+            if auth_mode == "password" and new_pw:
+                s["password_enc"] = _obfuscate(new_pw)
+            elif auth_mode == "key":
+                s["password_enc"] = ""
+            break
+    save_config(cfg)
+    return jsonify({"ok": True})
+
 @app.route("/api/repos", methods=["POST"])
 def api_add_repo():
     cfg = load_config()
@@ -218,6 +241,21 @@ def api_add_repo():
 def api_delete_repo(rid):
     cfg = load_config()
     cfg["repos"] = [r for r in cfg["repos"] if r["id"] != rid]
+    save_config(cfg)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/repos/<rid>", methods=["PUT"])
+def api_edit_repo(rid):
+    cfg = load_config()
+    data = request.json
+    for r in cfg["repos"]:
+        if r["id"] == rid:
+            r["name"]     = data["name"]
+            r["local"]    = data["local"]
+            r["remote"]   = data["remote"]
+            r["excludes"] = [e.strip() for e in data.get("excludes", "").split(",") if e.strip()]
+            break
     save_config(cfg)
     return jsonify({"ok": True})
 
@@ -778,6 +816,7 @@ function renderServerPage() {
       </div>
       <div class="row-actions">
         ${authBadge}
+        <button class="btn btn-sm" title="编辑" onclick="openEditServer('${s.id}')">编辑</button>
         <button class="btn btn-icon danger" title="删除" onclick="deleteServer('${s.id}')">✕</button>
       </div>
     </div>`;
@@ -795,6 +834,7 @@ function renderRepoPage() {
       </div>
       <div class="row-actions">
         <span class="badge badge-gray" style="font-size:9px;">${(r.excludes||[]).length} 排除规则</span>
+        <button class="btn btn-sm" title="编辑" onclick="openEditRepo('${r.id}')">编辑</button>
         <button class="btn btn-icon danger" title="删除" onclick="deleteRepo('${r.id}')">✕</button>
       </div>
     </div>`).join('') : '<div class="empty">暂无仓库</div>';
@@ -1033,8 +1073,133 @@ function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+
+// ── Edit helpers ──────────────────────────────────────────────────────────────
+function toggleEditAuthMode() {
+  const mode = document.getElementById('es-auth').value;
+  document.getElementById('es-key-group').style.display  = mode === 'key'      ? '' : 'none';
+  document.getElementById('es-pass-group').style.display = mode === 'password' ? '' : 'none';
+}
+
+function toggleEditPassVis() {
+  const inp = document.getElementById('es-password');
+  const btn = document.getElementById('es-pass-eye');
+  if (inp.type === 'password') { inp.type = 'text'; btn.textContent = '隐藏'; }
+  else { inp.type = 'password'; btn.textContent = '显示'; }
+}
+
+function openEditServer(id) {
+  const s = cfg.servers.find(x => x.id === id);
+  if (!s) return;
+  document.getElementById('es-id').value   = s.id;
+  document.getElementById('es-name').value = s.name;
+  document.getElementById('es-host').value = s.host;
+  document.getElementById('es-port').value = s.port;
+  document.getElementById('es-user').value = s.user;
+  document.getElementById('es-auth').value = s.auth_mode || 'key';
+  document.getElementById('es-key').value  = s.key || '';
+  document.getElementById('es-password').value = '';
+  toggleEditAuthMode();
+  openModal('modal-edit-server');
+}
+
+async function saveServer() {
+  const id   = document.getElementById('es-id').value;
+  const name = document.getElementById('es-name').value.trim();
+  const host = document.getElementById('es-host').value.trim();
+  if (!name || !host) return alert('名称和主机地址不能为空');
+  const auth_mode = document.getElementById('es-auth').value;
+  await api('PUT', `/api/servers/${id}`, {
+    name, host,
+    port: parseInt(document.getElementById('es-port').value) || 22,
+    user: document.getElementById('es-user').value.trim() || 'root',
+    auth_mode,
+    key:      auth_mode === 'key'      ? document.getElementById('es-key').value.trim() : '',
+    password: auth_mode === 'password' ? document.getElementById('es-password').value   : '',
+  });
+  closeModal('modal-edit-server');
+  await loadAll();
+}
+
+function openEditRepo(id) {
+  const r = cfg.repos.find(x => x.id === id);
+  if (!r) return;
+  document.getElementById('er-id').value       = r.id;
+  document.getElementById('er-name').value     = r.name;
+  document.getElementById('er-local').value    = r.local;
+  document.getElementById('er-remote').value   = r.remote;
+  document.getElementById('er-excludes').value = (r.excludes || []).join(', ');
+  openModal('modal-edit-repo');
+}
+
+async function saveRepo() {
+  const id     = document.getElementById('er-id').value;
+  const name   = document.getElementById('er-name').value.trim();
+  const local  = document.getElementById('er-local').value.trim();
+  const remote = document.getElementById('er-remote').value.trim();
+  if (!name || !local || !remote) return alert('名称、本地路径、远程路径不能为空');
+  await api('PUT', `/api/repos/${id}`, {
+    name, local, remote,
+    excludes: document.getElementById('er-excludes').value,
+  });
+  closeModal('modal-edit-repo');
+  await loadAll();
+}
+
 loadAll();
 </script>
+
+<!-- Edit Server Modal -->
+<div class="modal-overlay" id="modal-edit-server">
+  <div class="modal">
+    <div class="modal-title">编辑服务器</div>
+    <input type="hidden" id="es-id">
+    <div class="form-row"><div class="field"><label>名称</label><input id="es-name" type="text"></div></div>
+    <div class="form-row"><div class="field"><label>IP / 域名</label><input id="es-host" type="text"></div></div>
+    <div class="form-row cols2">
+      <div class="field"><label>端口</label><input id="es-port" type="text"></div>
+      <div class="field"><label>用户名</label><input id="es-user" type="text"></div>
+    </div>
+    <div class="form-row">
+      <div class="field">
+        <label>认证方式</label>
+        <select id="es-auth" onchange="toggleEditAuthMode()">
+          <option value="key">SSH 密钥</option>
+          <option value="password">密码</option>
+        </select>
+      </div>
+    </div>
+    <div id="es-key-group" class="form-row"><div class="field"><label>SSH 密钥路径</label><input id="es-key" type="text" placeholder="~/.ssh/id_rsa"></div></div>
+    <div id="es-pass-group" class="form-row" style="display:none;"><div class="field">
+      <label>新密码（留空保持不变）</label>
+      <div style="position:relative;">
+        <input id="es-password" placeholder="留空则不修改密码" type="password" style="padding-right:40px;">
+        <button type="button" onclick="toggleEditPassVis()" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text3);cursor:pointer;font-size:12px;font-family:var(--sans);" id="es-pass-eye">显示</button>
+      </div>
+    </div></div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('modal-edit-server')">取消</button>
+      <button class="btn btn-green" onclick="saveServer()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Repo Modal -->
+<div class="modal-overlay" id="modal-edit-repo">
+  <div class="modal">
+    <div class="modal-title">编辑仓库</div>
+    <input type="hidden" id="er-id">
+    <div class="form-row"><div class="field"><label>仓库名称</label><input id="er-name" type="text"></div></div>
+    <div class="form-row"><div class="field"><label>本地路径</label><input id="er-local" type="text"></div></div>
+    <div class="form-row"><div class="field"><label>远程路径</label><input id="er-remote" type="text"></div></div>
+    <div class="form-row"><div class="field"><label>额外排除规则（逗号分隔）</label><input id="er-excludes" type="text" placeholder="*.log, .env, node_modules/"></div></div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('modal-edit-repo')">取消</button>
+      <button class="btn btn-green" onclick="saveRepo()">保存</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>"""
 
