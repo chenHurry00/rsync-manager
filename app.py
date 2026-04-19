@@ -100,6 +100,9 @@ def get_repo_roots(repo: dict) -> tuple[str, str]:
     remote_root = repo["remote"].rstrip("/") or "/"
     return local_root, remote_root
 
+def format_remote_target(server: dict, path: str) -> str:
+    return f"{server['user']}@{server['host']}:{path}"
+
 def build_ssh_cmd(server: dict, remote_command: str) -> tuple[list[str], dict]:
     prefix, ssh_parts, extra_env = build_transport(server)
     target = f"{server['user']}@{server['host']}"
@@ -138,7 +141,7 @@ def build_rsync_cmd(repo: dict, server: dict, opts: dict) -> tuple[list[str], di
 
     if mode == "push":
         local = local_root.rstrip("/") + "/"
-        remote = f"{server['user']}@{server['host']}:{remote_root}"
+        remote = format_remote_target(server, remote_root)
         if opts.get("delete"):
             cmd.append("--delete")
 
@@ -159,15 +162,60 @@ def build_rsync_cmd(repo: dict, server: dict, opts: dict) -> tuple[list[str], di
         cmd += [local, remote]
         return cmd, extra_env
 
+    if mode == "manual_push":
+        relative_path = normalize_relative_remote_path(opts.get("relative_path", ""))
+        local = f"{local_root.rstrip('/')}/./{relative_path}"
+        remote_target = remote_root if remote_root == "/" else remote_root + "/"
+        remote = format_remote_target(server, remote_target)
+        cmd.append("--relative")
+        cmd += [local, remote]
+        return cmd, extra_env
+
     if mode == "pull":
         relative_path = normalize_relative_remote_path(opts.get("relative_path", ""))
-        remote = f"{server['user']}@{server['host']}:{remote_root}/./{relative_path}"
+        remote = format_remote_target(server, f"{remote_root}/./{relative_path}")
         local = local_root.rstrip("/") + "/"
         cmd.append("--relative")
         cmd += [remote, local]
         return cmd, extra_env
 
     raise ValueError(f"Unsupported sync mode: {mode}")
+
+def browse_local_entries(repo: dict, relative_path: str) -> dict:
+    current_path = normalize_relative_remote_path(relative_path, allow_root=True)
+    local_root, _ = get_repo_roots(repo)
+    root_path = Path(local_root).expanduser()
+    target_path = root_path if not current_path else root_path / current_path
+    if not target_path.exists():
+        raise ValueError("当前本地路径不存在")
+    if not target_path.is_dir():
+        raise ValueError("当前本地路径不是文件夹")
+
+    entries = []
+    for child in sorted(target_path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+        entry_type = "directory" if child.is_dir() else "file"
+        entry_path = child.name if not current_path else f"{current_path}/{child.name}"
+        size = None
+        if child.is_file():
+            try:
+                size = child.stat().st_size
+            except OSError:
+                size = None
+        entries.append({
+            "name": child.name,
+            "path": entry_path,
+            "type": entry_type,
+            "size": size,
+        })
+
+    parent_path = ""
+    if current_path:
+        parent_path = current_path.rsplit("/", 1)[0] if "/" in current_path else ""
+    return {
+        "current_path": current_path,
+        "parent_path": parent_path,
+        "entries": entries,
+    }
 
 def browse_remote_entries(repo: dict, server: dict, relative_path: str) -> dict:
     current_path = normalize_relative_remote_path(relative_path, allow_root=True)
@@ -227,6 +275,8 @@ def run_sync_job(job_id: str, repo: dict, server: dict, opts: dict):
     mode = opts.get("mode", "push")
     if mode == "pull":
         push_log(job_id, f"Starting pull: {server['name']}:{opts.get('relative_path', '')} → {repo['name']}", "start")
+    elif mode == "manual_push":
+        push_log(job_id, f"Starting manual upload: {repo['name']}:{opts.get('relative_path', '')} → {server['name']}", "start")
     else:
         push_log(job_id, f"Starting sync: {repo['name']} → {server['name']}", "start")
 
@@ -254,7 +304,13 @@ def run_sync_job(job_id: str, repo: dict, server: dict, opts: dict):
                 push_log(job_id, line, "output")
         proc.wait()
         if proc.returncode == 0:
-            push_log(job_id, "Pull completed successfully." if mode == "pull" else "Sync completed successfully.", "success")
+            if mode == "pull":
+                success_msg = "Pull completed successfully."
+            elif mode == "manual_push":
+                success_msg = "Manual upload completed successfully."
+            else:
+                success_msg = "Sync completed successfully."
+            push_log(job_id, success_msg, "success")
             record_sync_history(repo, server, opts)
         else:
             push_log(job_id, f"rsync exited with code {proc.returncode}", "error")
@@ -425,6 +481,34 @@ def api_pull():
     t.start()
     return jsonify({"job_id": job_id})
 
+@app.route("/api/push-manual", methods=["POST"])
+def api_push_manual():
+    data = request.json
+    cfg = load_config()
+    repo = next((r for r in cfg["repos"] if r["id"] == data["repo_id"]), None)
+    server = next((s for s in cfg["servers"] if s["id"] == data["server_id"]), None)
+    if not repo or not server:
+        return jsonify({"error": "repo or server not found"}), 404
+
+    try:
+        relative_path = normalize_relative_remote_path(data.get("relative_path", ""))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    job_id = str(int(time.time() * 1000))
+    opts = {
+        "mode": "manual_push",
+        "relative_path": relative_path,
+        "dry_run": data.get("dry_run", False),
+        "compress": data.get("compress", True),
+    }
+    with sync_lock:
+        sync_streams[job_id] = []
+
+    t = threading.Thread(target=run_sync_job, args=(job_id, repo, server, opts), daemon=True)
+    t.start()
+    return jsonify({"job_id": job_id})
+
 @app.route("/api/remote/browse", methods=["POST"])
 def api_remote_browse():
     data = request.json
@@ -450,6 +534,21 @@ def api_remote_browse():
         return jsonify({"error": "远程目录浏览超时"}), 504
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 500
+
+@app.route("/api/local/browse", methods=["POST"])
+def api_local_browse():
+    data = request.json
+    cfg = load_config()
+    repo = next((r for r in cfg["repos"] if r["id"] == data["repo_id"]), None)
+    if not repo:
+        return jsonify({"error": "repo not found"}), 404
+
+    try:
+        result = browse_local_entries(repo, data.get("relative_path", ""))
+        result["local_root"] = get_repo_roots(repo)[0]
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 @app.route("/api/sync/stream/<job_id>")
 def api_sync_stream(job_id):
@@ -790,6 +889,35 @@ tr:last-child td { border-bottom: none; }
           <button class="btn" id="stop-btn" style="display:none;color:var(--red);border-color:var(--red);" onclick="stopSync()">■ 停止</button>
           <button class="btn btn-sm" style="margin-left:auto;" onclick="clearLog()">清除日志</button>
         </div>
+        <div class="card-title" style="margin-top:20px;">本地定向上传</div>
+        <div class="stack">
+          <div class="field">
+            <label>已选本地相对路径</label>
+            <input id="push-relative-path" placeholder="请从下方本地浏览器中选择文件或文件夹" type="text">
+            <div class="field-help">手动上传会把：本地 <仓库本地根目录>/<相对路径> 传到远端 <仓库远端根目录>/<相对路径>。该操作忽略仓库级排除规则，只处理你显式选择的文件或目录。</div>
+          </div>
+          <div>
+            <div class="browser-toolbar">
+              <div>
+                <div class="card-title" style="margin-bottom:6px;">本地浏览器</div>
+                <div class="inline-note">浏览根目录：<span id="local-browser-root">—</span></div>
+              </div>
+              <div class="browser-toolbar-actions">
+                <button class="btn btn-sm" type="button" onclick="loadLocalBrowser(localBrowser.path, true)">刷新</button>
+                <button class="btn btn-sm" type="button" id="local-up-btn" onclick="browseLocalUp()">返回上级</button>
+                <button class="btn btn-sm" type="button" id="local-select-current-btn" onclick="selectCurrentLocalDir()">选择当前文件夹</button>
+              </div>
+            </div>
+            <div class="browser-breadcrumb" id="local-browser-path"></div>
+            <div class="browser-panel">
+              <div class="browser-list" id="local-browser-list"></div>
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px;">
+          <button class="btn btn-blue" onclick="startManualPush()">↑ 上传选中文件/目录</button>
+          <span class="inline-note">用于补传被排除规则挡住的内容；不会自动删除远端其他文件。</span>
+        </div>
         <div class="card-title" style="margin-top:20px;">远程定向回传</div>
         <div class="stack">
           <div class="field">
@@ -966,6 +1094,17 @@ let remoteBrowser = {
   selectedPath: '',
   selectedType: '',
 };
+let localBrowser = {
+  repoId: '',
+  rootLocal: '',
+  path: '',
+  parentPath: '',
+  entries: [],
+  loading: false,
+  error: '',
+  selectedPath: '',
+  selectedType: '',
+};
 
 async function api(method, path, body) {
   const r = await fetch(path, {
@@ -1133,43 +1272,141 @@ function resetRemoteBrowserState(repoId = '', serverId = '', rootRemote = '') {
   if (input) input.value = '';
 }
 
+function resetLocalBrowserState(repoId = '', rootLocal = '') {
+  localBrowser = {
+    repoId,
+    rootLocal,
+    path: '',
+    parentPath: '',
+    entries: [],
+    loading: false,
+    error: '',
+    selectedPath: '',
+    selectedType: '',
+  };
+  const input = document.getElementById('push-relative-path');
+  if (input) input.value = '';
+}
+
 function handleSyncTargetChange(forceReload = false) {
   const { repoId, serverId, repo, server } = getSyncSelection();
-  const targetChanged = remoteBrowser.repoId !== repoId || remoteBrowser.serverId !== serverId;
-  if (!repo || !server) {
-    resetRemoteBrowserState(repoId, serverId, repo?.remote || '');
+  const localTargetChanged = localBrowser.repoId !== repoId;
+  const remoteTargetChanged = remoteBrowser.repoId !== repoId || remoteBrowser.serverId !== serverId;
+
+  if (!repo) {
+    resetLocalBrowserState(repoId, '');
+    resetRemoteBrowserState(repoId, serverId, '');
+    renderLocalBrowser();
     renderRemoteBrowser();
     return;
   }
-  if (targetChanged) {
+
+  if (localTargetChanged) {
+    resetLocalBrowserState(repoId, repo.local);
+  } else {
+    localBrowser.rootLocal = repo.local;
+  }
+
+  if (!server) {
+    resetRemoteBrowserState(repoId, serverId, repo.remote);
+  } else if (remoteTargetChanged) {
     resetRemoteBrowserState(repoId, serverId, repo.remote);
   } else {
     remoteBrowser.rootRemote = repo.remote;
   }
+
+  renderLocalBrowser();
   renderRemoteBrowser();
-  if (forceReload || targetChanged) {
+
+  if (forceReload || localTargetChanged) {
+    loadLocalBrowser('');
+  }
+  if (server && (forceReload || remoteTargetChanged)) {
     loadRemoteBrowser('');
   }
 }
 
 async function ensureRemoteBrowserLoaded(forceReload = false) {
   const { repoId, serverId, repo, server } = getSyncSelection();
-  if (!repo || !server) {
-    resetRemoteBrowserState(repoId, serverId, repo?.remote || '');
+  if (!repo) {
+    resetLocalBrowserState(repoId, '');
+    resetRemoteBrowserState(repoId, serverId, '');
+    renderLocalBrowser();
     renderRemoteBrowser();
     return;
   }
-  const targetChanged = remoteBrowser.repoId !== repoId || remoteBrowser.serverId !== serverId;
-  if (targetChanged) {
+
+  const localTargetChanged = localBrowser.repoId !== repoId;
+  const remoteTargetChanged = remoteBrowser.repoId !== repoId || remoteBrowser.serverId !== serverId;
+
+  if (localTargetChanged) {
+    resetLocalBrowserState(repoId, repo.local);
+  } else {
+    localBrowser.rootLocal = repo.local;
+  }
+
+  if (!server) {
+    resetRemoteBrowserState(repoId, serverId, repo.remote);
+  } else if (remoteTargetChanged) {
     resetRemoteBrowserState(repoId, serverId, repo.remote);
   } else {
     remoteBrowser.rootRemote = repo.remote;
   }
-  if (forceReload || targetChanged || (!remoteBrowser.loading && !remoteBrowser.error && !remoteBrowser.entries.length)) {
+
+  if (forceReload || localTargetChanged || (!localBrowser.loading && !localBrowser.error && !localBrowser.entries.length)) {
+    await loadLocalBrowser(localBrowser.path || '');
+  } else {
+    renderLocalBrowser();
+  }
+
+  if (!server) {
+    renderRemoteBrowser();
+    return;
+  }
+
+  if (forceReload || remoteTargetChanged || (!remoteBrowser.loading && !remoteBrowser.error && !remoteBrowser.entries.length)) {
     await loadRemoteBrowser(remoteBrowser.path || '');
     return;
   }
   renderRemoteBrowser();
+}
+
+async function loadLocalBrowser(relativePath = '', forceReload = false) {
+  const { repoId, repo } = getSyncSelection();
+  if (!repo) {
+    renderLocalBrowser();
+    return;
+  }
+
+  localBrowser.repoId = repoId;
+  localBrowser.rootLocal = repo.local;
+  localBrowser.loading = true;
+  localBrowser.error = '';
+  localBrowser.path = relativePath || '';
+  if (forceReload) {
+    localBrowser.entries = [];
+  }
+  renderLocalBrowser();
+
+  const res = await api('POST', '/api/local/browse', {
+    repo_id: repoId,
+    relative_path: relativePath || '',
+  });
+
+  localBrowser.loading = false;
+  if (res.error) {
+    localBrowser.error = res.error;
+    localBrowser.entries = [];
+    renderLocalBrowser();
+    return;
+  }
+
+  localBrowser.rootLocal = res.local_root || repo.local;
+  localBrowser.path = res.current_path || '';
+  localBrowser.parentPath = res.parent_path || '';
+  localBrowser.entries = res.entries || [];
+  localBrowser.error = '';
+  renderLocalBrowser();
 }
 
 async function loadRemoteBrowser(relativePath = '', forceReload = false) {
@@ -1301,6 +1538,95 @@ function setSelectedRemotePath(path, entryType) {
   renderRemoteBrowser();
 }
 
+function renderLocalBrowser() {
+  const rootEl = document.getElementById('local-browser-root');
+  const pathEl = document.getElementById('local-browser-path');
+  const listEl = document.getElementById('local-browser-list');
+  const upBtn = document.getElementById('local-up-btn');
+  const selectCurrentBtn = document.getElementById('local-select-current-btn');
+  if (!rootEl || !pathEl || !listEl || !upBtn || !selectCurrentBtn) return;
+
+  rootEl.textContent = localBrowser.rootLocal || '—';
+  upBtn.disabled = !localBrowser.path || localBrowser.loading;
+  selectCurrentBtn.disabled = !localBrowser.path || localBrowser.loading;
+
+  const { repo } = getSyncSelection();
+  if (!repo) {
+    pathEl.innerHTML = '<span class="inline-note">先选择仓库，再浏览本地目录。</span>';
+    listEl.innerHTML = '<div class="empty">暂无可浏览的本地目录</div>';
+    return;
+  }
+
+  const crumbs = [];
+  crumbs.push(`<button class="crumb-btn" type="button" data-local-action="navigate" data-path="">${esc(localBrowser.rootLocal || '/')}</button>`);
+  let acc = '';
+  for (const segment of (localBrowser.path ? localBrowser.path.split('/') : [])) {
+    acc = acc ? `${acc}/${segment}` : segment;
+    crumbs.push('<span>/</span>');
+    crumbs.push(`<button class="crumb-btn" type="button" data-local-action="navigate" data-path="${escAttr(acc)}">${esc(segment)}</button>`);
+  }
+  if (localBrowser.selectedPath) {
+    crumbs.push(`<span class="browser-tag">已选：${esc(localBrowser.selectedPath)}</span>`);
+  }
+  pathEl.innerHTML = crumbs.join('');
+
+  if (localBrowser.loading) {
+    listEl.innerHTML = '<div class="empty">本地目录加载中...</div>';
+    return;
+  }
+  if (localBrowser.error) {
+    listEl.innerHTML = `<div class="empty text-danger">${esc(localBrowser.error)}</div>`;
+    return;
+  }
+  if (!localBrowser.entries.length) {
+    listEl.innerHTML = '<div class="empty">当前目录为空</div>';
+    return;
+  }
+
+  listEl.innerHTML = localBrowser.entries.map(entry => {
+    const selected = entry.path === localBrowser.selectedPath ? ' selected' : '';
+    const kind = entry.type === 'directory' ? '目录' : '文件';
+    const meta = entry.type === 'directory'
+      ? '<span class="browser-tag">可进入</span>'
+      : `<span class="browser-tag">${formatBytes(entry.size)}</span>`;
+    const actions = entry.type === 'directory'
+      ? `<button class="btn btn-sm" type="button" data-local-action="navigate" data-path="${escAttr(entry.path)}">进入</button>
+         <button class="btn btn-sm" type="button" data-local-action="select" data-path="${escAttr(entry.path)}" data-entry-type="directory">选择文件夹</button>`
+      : `<button class="btn btn-sm" type="button" data-local-action="select" data-path="${escAttr(entry.path)}" data-entry-type="file">选择文件</button>`;
+    return `
+      <div class="item browser-row${selected}">
+        <div class="item-dot" style="background:${entry.type === 'directory' ? 'var(--green)' : 'var(--blue)'}"></div>
+        <div class="item-body">
+          <div class="item-name">${esc(entry.name)}</div>
+          <div class="item-sub"><span>${esc(entry.path)}</span>${meta}</div>
+        </div>
+        <span class="badge badge-${entry.type === 'directory' ? 'green' : 'blue'}">${kind}</span>
+        <div class="row-actions">${actions}</div>
+      </div>`;
+  }).join('');
+}
+
+function browseLocalUp() {
+  if (!localBrowser.path || localBrowser.loading) return;
+  loadLocalBrowser(localBrowser.parentPath || '');
+}
+
+function selectCurrentLocalDir() {
+  if (!localBrowser.path) {
+    alert('仓库本地根目录不能直接作为定向上传目标，请继续进入具体文件夹后再选择。');
+    return;
+  }
+  setSelectedLocalPath(localBrowser.path, 'directory');
+}
+
+function setSelectedLocalPath(path, entryType) {
+  localBrowser.selectedPath = path || '';
+  localBrowser.selectedType = entryType || '';
+  const input = document.getElementById('push-relative-path');
+  if (input) input.value = localBrowser.selectedPath;
+  renderLocalBrowser();
+}
+
 function toggleAuthMode() {
   const mode = document.getElementById('ns-auth').value;
   document.getElementById('ns-key-group').style.display  = mode === 'key'      ? '' : 'none';
@@ -1420,6 +1746,22 @@ async function startSync() {
   });
 }
 
+async function startManualPush() {
+  const repoId = document.getElementById('sync-repo').value;
+  const serverId = document.getElementById('sync-server').value;
+  const relativePath = document.getElementById('push-relative-path').value.trim();
+  if (!repoId || !serverId) return alert('请先添加服务器和仓库');
+  if (!relativePath) return alert('请先在本地浏览器中选择需要上传的文件或文件夹');
+
+  await startJob('/api/push-manual', {
+    repo_id: repoId,
+    server_id: serverId,
+    relative_path: relativePath,
+    dry_run: document.getElementById('opt-dry').checked,
+    compress: document.getElementById('opt-compress').checked,
+  });
+}
+
 async function startPull() {
   const repoId = document.getElementById('sync-repo').value;
   const serverId = document.getElementById('sync-server').value;
@@ -1535,11 +1877,13 @@ async function loadHistory() {
   const el = document.getElementById('history-table');
   if (!h.length) { el.innerHTML = '<div class="empty">暂无同步记录</div>'; return; }
   const rows = h.map(r => {
-    const mode = r.mode === 'pull' ? 'pull' : 'push';
-    const path = mode === 'pull' ? (r.path || '—') : '—';
+    const mode = r.mode || 'push';
+    const modeLabel = mode === 'manual_push' ? 'manual-push' : mode;
+    const modeBadge = mode === 'pull' ? 'blue' : (mode === 'manual_push' ? 'amber' : 'gray');
+    const path = (mode === 'pull' || mode === 'manual_push') ? (r.path || '—') : '—';
     return `<tr>
       <td>${esc(r.time)}</td>
-      <td><span class="badge badge-${mode === 'pull' ? 'blue' : 'gray'}">${mode}</span></td>
+      <td><span class="badge badge-${modeBadge}">${modeLabel}</span></td>
       <td>${esc(r.repo)}</td>
       <td>${esc(r.server)}</td>
       <td>${esc(path)}</td>
@@ -1584,15 +1928,29 @@ function formatBytes(size) {
 
 document.addEventListener('click', event => {
   const actionEl = event.target.closest('[data-remote-action]');
-  if (!actionEl) return;
-  const action = actionEl.dataset.remoteAction;
-  const path = actionEl.dataset.path || '';
-  if (action === 'navigate') {
-    loadRemoteBrowser(path);
+  if (actionEl) {
+    const action = actionEl.dataset.remoteAction;
+    const path = actionEl.dataset.path || '';
+    if (action === 'navigate') {
+      loadRemoteBrowser(path);
+      return;
+    }
+    if (action === 'select') {
+      setSelectedRemotePath(path, actionEl.dataset.entryType || '');
+      return;
+    }
+  }
+
+  const localActionEl = event.target.closest('[data-local-action]');
+  if (!localActionEl) return;
+  const localAction = localActionEl.dataset.localAction;
+  const localPath = localActionEl.dataset.path || '';
+  if (localAction === 'navigate') {
+    loadLocalBrowser(localPath);
     return;
   }
-  if (action === 'select') {
-    setSelectedRemotePath(path, actionEl.dataset.entryType || '');
+  if (localAction === 'select') {
+    setSelectedLocalPath(localPath, localActionEl.dataset.entryType || '');
   }
 });
 
