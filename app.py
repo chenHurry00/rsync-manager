@@ -531,14 +531,18 @@ def api_sync():
     if not repo or not server:
         return jsonify({"error": "repo or server not found"}), 404
 
-    job_id = str(int(time.time() * 1000))
-    opts = {
-        "mode": "push",
-        "delete": data.get("delete", True),
+    push_opts = {
+        "delete": data.get("delete", False),
         "dry_run": data.get("dry_run", False),
         "compress": data.get("compress", True),
         "gitignore": data.get("gitignore", True),
     }
+    if not push_opts["dry_run"]:
+        repo["push_opts"] = {k: v for k, v in push_opts.items() if k != "dry_run"}
+        save_config(cfg)
+
+    job_id = str(int(time.time() * 1000))
+    opts = {"mode": "push", **push_opts}
     with sync_lock:
         sync_streams[job_id] = []
 
@@ -1015,7 +1019,7 @@ tr:last-child td { border-bottom: none; }
           <div class="field"><label>服务器</label><select id="sync-server" onchange="handleSyncTargetChange(true)"></select></div>
         </div>
         <div class="card-title" style="margin-top:4px;">推送选项</div>
-        <div class="checkbox-row"><input type="checkbox" id="opt-delete" checked><label for="opt-delete">删除远端多余文件 (--delete)</label></div>
+        <div class="checkbox-row"><input type="checkbox" id="opt-delete"><label for="opt-delete">删除远端多余文件 (--delete)</label></div>
         <div class="checkbox-row"><input type="checkbox" id="opt-dry"><label for="opt-dry">预演模式 (--dry-run)，不实际传输</label></div>
         <div class="checkbox-row"><input type="checkbox" id="opt-compress" checked><label for="opt-compress">启用传输压缩 (-z)</label></div>
         <div class="checkbox-row"><input type="checkbox" id="opt-gitignore" checked><label for="opt-gitignore">自动读取 .gitignore 排除规则</label></div>
@@ -1514,6 +1518,13 @@ function handleSyncTargetChange(forceReload = false) {
   }
   if (server && (forceReload || remoteTargetChanged)) {
     loadRemoteBrowser('');
+  }
+
+  if (anyTargetChanged && repo) {
+    const opts = repo.push_opts || {};
+    document.getElementById('opt-delete').checked  = opts.delete   ?? false;
+    document.getElementById('opt-compress').checked = opts.compress ?? true;
+    document.getElementById('opt-gitignore').checked = opts.gitignore ?? true;
   }
 }
 
@@ -2143,14 +2154,19 @@ async function startSync() {
   const repoId = document.getElementById('sync-repo').value;
   const serverId = document.getElementById('sync-server').value;
   if (!repoId || !serverId) return alert('请先添加服务器和仓库');
+  const deleteOpt   = document.getElementById('opt-delete').checked;
+  const dryRun      = document.getElementById('opt-dry').checked;
+  const compressOpt = document.getElementById('opt-compress').checked;
+  const gitignoreOpt = document.getElementById('opt-gitignore').checked;
   await startJob('/api/sync', {
-    repo_id: repoId,
-    server_id: serverId,
-    delete: document.getElementById('opt-delete').checked,
-    dry_run: document.getElementById('opt-dry').checked,
-    compress: document.getElementById('opt-compress').checked,
-    gitignore: document.getElementById('opt-gitignore').checked,
+    repo_id: repoId, server_id: serverId,
+    delete: deleteOpt, dry_run: dryRun,
+    compress: compressOpt, gitignore: gitignoreOpt,
   });
+  if (!dryRun) {
+    const repo = cfg.repos.find(r => r.id === repoId);
+    if (repo) repo.push_opts = { delete: deleteOpt, compress: compressOpt, gitignore: gitignoreOpt };
+  }
 }
 
 async function startManualPush() {
@@ -2200,18 +2216,21 @@ function stopSync() {
 
 async function startSyncAll() {
   clearLog();
+  const deleteOpt    = document.getElementById('opt-delete').checked;
+  const dryRun       = document.getElementById('opt-dry').checked;
+  const compressOpt  = document.getElementById('opt-compress').checked;
+  const gitignoreOpt = document.getElementById('opt-gitignore').checked;
   for (const repo of cfg.repos) {
     const sid = document.getElementById('sync-server').value;
     if (!sid) { alert('请先选择目标服务器'); return; }
     addLogLine(new Date().toLocaleTimeString(), `Queueing: ${repo.name}`, 'info');
     const res = await api('POST', '/api/sync', {
       repo_id: repo.id, server_id: sid,
-      delete: document.getElementById('opt-delete').checked,
-      dry_run: document.getElementById('opt-dry').checked,
-      compress: document.getElementById('opt-compress').checked,
-      gitignore: document.getElementById('opt-gitignore').checked,
+      delete: deleteOpt, dry_run: dryRun,
+      compress: compressOpt, gitignore: gitignoreOpt,
     });
     if (!res.job_id) continue;
+    if (!dryRun) repo.push_opts = { delete: deleteOpt, compress: compressOpt, gitignore: gitignoreOpt };
     await new Promise(resolve => {
       const es = new EventSource(`/api/sync/stream/${res.job_id}`);
       es.onmessage = e => {
