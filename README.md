@@ -1,18 +1,20 @@
-# CodeSync
+# rsync-manager
 
-基于 rsync 的代码仓库同步 Web 管理工具。
+基于 `rsync` 的代码仓库同步 Web 管理工具。
+
+运行配置不会写回仓库，而是保存在 `~/.codesync/config.json`。
 
 ## 快速开始
 
 ```bash
 # 安装依赖
-pip install flask
+python3 -m pip install -r requirements.txt
 
 # 启动
-python app.py
+python3 app.py
 
-# 打开浏览器访问
-open http://localhost:7788
+# 浏览器访问
+# http://localhost:7788
 ```
 
 ## 功能
