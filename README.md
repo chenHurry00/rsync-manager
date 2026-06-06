@@ -2,6 +2,8 @@
 
 基于 `rsync` 的代码仓库同步 Web 管理工具。
 
+![](manager.png)
+
 运行配置不会写回仓库，而是保存在 `~/.codesync/config.json`。
 
 ## 快速开始
