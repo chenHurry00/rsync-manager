@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 CodeSync - Python Web UI for rsync-based code repository synchronization
 Run: python app.py
@@ -46,6 +48,71 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     CONFIG_FILE.parent.mkdir(exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+
+VALID_BROWSER_SORT_FIELDS = {"name", "time", "size"}
+VALID_BROWSER_SORT_ORDERS = {"asc", "desc"}
+DEFAULT_BROWSER_PANEL_OPTIONS = {"sort_by": "name", "sort_order": "asc"}
+
+def build_default_browser_options() -> dict:
+    return {
+        "local": dict(DEFAULT_BROWSER_PANEL_OPTIONS),
+        "remote": dict(DEFAULT_BROWSER_PANEL_OPTIONS),
+    }
+
+def normalize_browser_sort_options(sort_by: str, sort_order: str) -> dict:
+    normalized_sort_by = sort_by if sort_by in VALID_BROWSER_SORT_FIELDS else DEFAULT_BROWSER_PANEL_OPTIONS["sort_by"]
+    normalized_sort_order = sort_order if sort_order in VALID_BROWSER_SORT_ORDERS else DEFAULT_BROWSER_PANEL_OPTIONS["sort_order"]
+    return {"sort_by": normalized_sort_by, "sort_order": normalized_sort_order}
+
+def get_repo_browser_options(repo: dict) -> dict:
+    options = build_default_browser_options()
+    if not isinstance(repo, dict):
+        return options
+
+    raw_options = repo.get("browser_opts", {})
+    if not isinstance(raw_options, dict):
+        return options
+
+    for direction in ("local", "remote"):
+        raw_direction_options = raw_options.get(direction, {})
+        if not isinstance(raw_direction_options, dict):
+            continue
+        options[direction] = normalize_browser_sort_options(
+            raw_direction_options.get("sort_by", DEFAULT_BROWSER_PANEL_OPTIONS["sort_by"]),
+            raw_direction_options.get("sort_order", DEFAULT_BROWSER_PANEL_OPTIONS["sort_order"]),
+        )
+    return options
+
+def sort_entries_by_name(entries: list[dict], descending: bool) -> list[dict]:
+    return sorted(entries, key=lambda item: item["name"].lower(), reverse=descending)
+
+def sort_entries_by_numeric(entries: list[dict], field_name: str, descending: bool) -> list[dict]:
+    entries_by_name = sort_entries_by_name(entries, descending)
+    return sorted(
+        entries_by_name,
+        key=lambda item: (
+            item.get(field_name) is None,
+            -(item.get(field_name) or 0) if descending else (item.get(field_name) or 0),
+        ),
+    )
+
+def sort_browser_entries(entries: list[dict], sort_by: str = "name", sort_order: str = "asc") -> list[dict]:
+    options = normalize_browser_sort_options(sort_by, sort_order)
+    descending = options["sort_order"] == "desc"
+    directories = [item for item in entries if item.get("type") == "directory"]
+    files = [item for item in entries if item.get("type") != "directory"]
+
+    if options["sort_by"] == "time":
+        directories = sort_entries_by_numeric(directories, "mtime", descending)
+        files = sort_entries_by_numeric(files, "mtime", descending)
+    elif options["sort_by"] == "size":
+        directories = sort_entries_by_name(directories, descending)
+        files = sort_entries_by_numeric(files, "size", descending)
+    else:
+        directories = sort_entries_by_name(directories, descending)
+        files = sort_entries_by_name(files, descending)
+
+    return directories + files
 
 # ── SSE sync log stream ───────────────────────────────────────────────────────
 sync_streams: dict[str, list[str]] = {}   # job_id -> list of log lines
@@ -198,7 +265,13 @@ def build_rsync_cmd(repo: dict, server: dict, opts: dict) -> tuple[list[str], di
 
     raise ValueError(f"Unsupported sync mode: {mode}")
 
-def browse_local_entries(repo: dict, relative_path: str, show_hidden: bool = False) -> dict:
+def browse_local_entries(
+    repo: dict,
+    relative_path: str,
+    show_hidden: bool = False,
+    sort_by: str = "name",
+    sort_order: str = "asc",
+) -> dict:
     current_path = normalize_relative_remote_path(relative_path, allow_root=True)
     local_root, _ = get_repo_roots(repo)
     root_path = Path(local_root).expanduser()
@@ -209,24 +282,29 @@ def browse_local_entries(repo: dict, relative_path: str, show_hidden: bool = Fal
         raise ValueError("当前本地路径不是文件夹")
 
     entries = []
-    for child in sorted(target_path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+    for child in target_path.iterdir():
         if not show_hidden and child.name.startswith("."):
             continue
         entry_type = "directory" if child.is_dir() else "file"
         entry_path = child.name if not current_path else f"{current_path}/{child.name}"
         size = None
-        if child.is_file():
-            try:
-                size = child.stat().st_size
-            except OSError:
-                size = None
+        mtime = None
+        try:
+            stat_result = child.stat()
+            mtime = stat_result.st_mtime
+            if entry_type == "file":
+                size = stat_result.st_size
+        except OSError:
+            pass
         entries.append({
             "name": child.name,
             "path": entry_path,
             "type": entry_type,
             "size": size,
+            "mtime": mtime,
         })
 
+    entries = sort_browser_entries(entries, sort_by, sort_order)
     parent_path = ""
     if current_path:
         parent_path = current_path.rsplit("/", 1)[0] if "/" in current_path else ""
@@ -236,7 +314,14 @@ def browse_local_entries(repo: dict, relative_path: str, show_hidden: bool = Fal
         "entries": entries,
     }
 
-def browse_remote_entries(repo: dict, server: dict, relative_path: str, show_hidden: bool = False) -> dict:
+def browse_remote_entries(
+    repo: dict,
+    server: dict,
+    relative_path: str,
+    show_hidden: bool = False,
+    sort_by: str = "name",
+    sort_order: str = "asc",
+) -> dict:
     current_path = normalize_relative_remote_path(relative_path, allow_root=True)
     _, remote_root = get_repo_roots(repo)
     remote_abs = remote_root if not current_path else posixpath.join(remote_root, current_path)
@@ -246,7 +331,7 @@ if [ ! -d "$TARGET" ]; then
   printf '__CODESYNC_ERROR__\\tnot_directory\\n'
   exit 12
 fi
-find "$TARGET" -mindepth 1 -maxdepth 1 {hidden_filter}\\( -type d -o -type f -o -type l \\) -printf '%P\\t%y\\t%s\\n' 2>/dev/null | LC_ALL=C sort
+find "$TARGET" -mindepth 1 -maxdepth 1 {hidden_filter}\\( -type d -o -type f -o -type l \\) -printf '%P\\t%y\\t%s\\t%T@\\n' 2>/dev/null
 """
     cmd, extra_env = build_ssh_cmd(server, remote_cmd)
     env = {**os.environ, **extra_env}
@@ -269,19 +354,26 @@ find "$TARGET" -mindepth 1 -maxdepth 1 {hidden_filter}\\( -type d -o -type f -o 
     for raw_line in proc.stdout.splitlines():
         if not raw_line:
             continue
-        name, kind, size = (raw_line.split("\t", 2) + ["", "", ""])[:3]
+        name, kind, size, mtime = (raw_line.split("\t", 3) + ["", "", "", ""])[:4]
         if not name:
             continue
         entry_type = "directory" if kind == "d" else "file"
         entry_path = name if not current_path else f"{current_path}/{name}"
+        parsed_mtime = None
+        if mtime:
+            try:
+                parsed_mtime = float(mtime)
+            except ValueError:
+                parsed_mtime = None
         entries.append({
             "name": name,
             "path": entry_path,
             "type": entry_type,
             "size": int(size) if size.isdigit() else None,
+            "mtime": parsed_mtime,
         })
 
-    entries.sort(key=lambda item: (item["type"] != "directory", item["name"].lower()))
+    entries = sort_browser_entries(entries, sort_by, sort_order)
     parent_path = ""
     if current_path:
         parent_path = current_path.rsplit("/", 1)[0] if "/" in current_path else ""
@@ -431,6 +523,8 @@ def api_get_config():
         sc["has_password"] = bool(s.get("password_enc"))
         safe_servers.append(sc)
     cfg["servers"] = safe_servers
+    for repo in cfg.get("repos", []):
+        repo["browser_opts"] = get_repo_browser_options(repo)
     return jsonify(cfg)
 
 @app.route("/api/servers", methods=["POST"])
@@ -495,6 +589,7 @@ def api_add_repo():
         "local": data["local"],
         "remote": data["remote"],
         "excludes": [e.strip() for e in data.get("excludes", "").split(",") if e.strip()],
+        "browser_opts": build_default_browser_options(),
     }
     cfg["repos"].append(repo)
     save_config(cfg)
@@ -518,9 +613,31 @@ def api_edit_repo(rid):
             r["local"]    = data["local"]
             r["remote"]   = data["remote"]
             r["excludes"] = [e.strip() for e in data.get("excludes", "").split(",") if e.strip()]
+            r["browser_opts"] = get_repo_browser_options(r)
             break
     save_config(cfg)
     return jsonify({"ok": True})
+
+@app.route("/api/repos/<rid>/browser-options", methods=["PUT"])
+def api_save_repo_browser_options(rid):
+    cfg = load_config()
+    data = request.json or {}
+    direction = data.get("direction")
+    if direction not in {"local", "remote"}:
+        return jsonify({"error": "invalid browser direction"}), 400
+
+    for repo in cfg["repos"]:
+        if repo["id"] != rid:
+            continue
+        browser_opts = get_repo_browser_options(repo)
+        browser_opts[direction] = normalize_browser_sort_options(
+            data.get("sort_by", "name"),
+            data.get("sort_order", "asc"),
+        )
+        repo["browser_opts"] = browser_opts
+        save_config(cfg)
+        return jsonify({"browser_opts": browser_opts})
+    return jsonify({"error": "repo not found"}), 404
 
 @app.route("/api/sync", methods=["POST"])
 def api_sync():
@@ -621,6 +738,8 @@ def api_remote_browse():
             server,
             data.get("relative_path", ""),
             bool(data.get("show_hidden", False)),
+            data.get("sort_by", "name"),
+            data.get("sort_order", "asc"),
         )
         result["remote_root"] = get_repo_roots(repo)[1]
         return jsonify(result)
@@ -650,6 +769,8 @@ def api_local_browse():
             repo,
             data.get("relative_path", ""),
             bool(data.get("show_hidden", False)),
+            data.get("sort_by", "name"),
+            data.get("sort_order", "asc"),
         )
         result["local_root"] = get_repo_roots(repo)[0]
         return jsonify(result)
@@ -928,6 +1049,15 @@ tr:last-child td { border-bottom: none; }
 .text-danger { color: var(--red); }
 .toolbar-check { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text2); font-family: var(--mono); }
 .toolbar-check input { accent-color: var(--green); width: 14px; height: 14px; }
+.browser-sort { display: flex; align-items: center; gap: 6px; padding: 4px; border: 1px solid var(--border); border-radius: 999px; background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.02); }
+.browser-sort-label { font-size: 10px; color: var(--text3); font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.08em; padding-left: 8px; }
+.browser-sort-select { min-width: 82px; padding: 6px 10px; border: none; border-radius: 999px; background: transparent; color: var(--text); font-size: 11px; font-family: var(--mono); cursor: pointer; outline: none; }
+.browser-sort-select:focus { background: var(--bg3); }
+.browser-sort-select option { background: var(--bg2); }
+.browser-sort-order { min-width: 62px; padding: 6px 12px; border: none; border-radius: 999px; background: var(--green-dim); color: var(--green); font-size: 10px; font-family: var(--mono); cursor: pointer; transition: all 0.15s; }
+.browser-sort-order:hover { filter: brightness(1.08); }
+.browser-sort-order.is-desc { background: var(--blue-dim); color: var(--blue); }
+.browser-sort-order:disabled, .browser-sort-select:disabled { opacity: 0.45; cursor: not-allowed; }
 .selection-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 .queue-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin: 12px 0 10px; }
 .queue-actions { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -1048,6 +1178,15 @@ tr:last-child td { border-bottom: none; }
                 <div class="inline-note">浏览根目录：<span id="local-browser-root">—</span></div>
               </div>
               <div class="browser-toolbar-actions">
+                <div class="browser-sort">
+                  <span class="browser-sort-label">排序</span>
+                  <select id="local-sort-by" class="browser-sort-select" onchange="setBrowserSortBy('local', this.value)">
+                    <option value="name">名称</option>
+                    <option value="time">时间</option>
+                    <option value="size">大小</option>
+                  </select>
+                  <button class="browser-sort-order" id="local-sort-order-btn" type="button" onclick="toggleBrowserSortOrder('local')">A-Z</button>
+                </div>
                 <label class="toolbar-check"><input id="local-show-hidden" type="checkbox" onchange="toggleBrowserHidden('local')">显示隐藏项</label>
                 <button class="btn btn-sm" type="button" onclick="loadLocalBrowser(localBrowser.path, true)">刷新</button>
                 <button class="btn btn-sm" type="button" id="local-up-btn" onclick="browseLocalUp()">返回上级</button>
@@ -1092,6 +1231,15 @@ tr:last-child td { border-bottom: none; }
                 <div class="inline-note">浏览根目录：<span id="remote-browser-root">—</span></div>
               </div>
               <div class="browser-toolbar-actions">
+                <div class="browser-sort">
+                  <span class="browser-sort-label">排序</span>
+                  <select id="remote-sort-by" class="browser-sort-select" onchange="setBrowserSortBy('remote', this.value)">
+                    <option value="name">名称</option>
+                    <option value="time">时间</option>
+                    <option value="size">大小</option>
+                  </select>
+                  <button class="browser-sort-order" id="remote-sort-order-btn" type="button" onclick="toggleBrowserSortOrder('remote')">A-Z</button>
+                </div>
                 <label class="toolbar-check"><input id="remote-show-hidden" type="checkbox" onchange="toggleBrowserHidden('remote')">显示隐藏项</label>
                 <button class="btn btn-sm" type="button" onclick="loadRemoteBrowser(remoteBrowser.path, true)">刷新</button>
                 <button class="btn btn-sm" type="button" id="remote-up-btn" onclick="browseRemoteUp()">返回上级</button>
@@ -1254,6 +1402,8 @@ let currentJobId = null;
 let syncESS = null;
 let currentStreamResolver = null;
 let queueStopRequested = false;
+const BROWSER_SORT_FIELDS = ['name', 'time', 'size'];
+const BROWSER_SORT_ORDERS = ['asc', 'desc'];
 let remoteBrowser = {
   repoId: '',
   serverId: '',
@@ -1264,6 +1414,8 @@ let remoteBrowser = {
   loading: false,
   error: '',
   showHidden: false,
+  sortBy: 'name',
+  sortOrder: 'asc',
   selectedPath: '',
   selectedType: '',
 };
@@ -1276,6 +1428,8 @@ let localBrowser = {
   loading: false,
   error: '',
   showHidden: false,
+  sortBy: 'name',
+  sortOrder: 'asc',
   selectedPath: '',
   selectedType: '',
 };
@@ -1283,6 +1437,44 @@ let transferQueues = {
   push: [],
   pull: [],
 };
+
+function normalizeBrowserPanelOptions(raw = {}) {
+  const sortBy = BROWSER_SORT_FIELDS.includes(raw.sort_by || raw.sortBy) ? (raw.sort_by || raw.sortBy) : 'name';
+  const sortOrder = BROWSER_SORT_ORDERS.includes(raw.sort_order || raw.sortOrder) ? (raw.sort_order || raw.sortOrder) : 'asc';
+  return { sortBy, sortOrder };
+}
+
+function getRepoBrowserOptions(repo) {
+  return {
+    local: normalizeBrowserPanelOptions(repo?.browser_opts?.local || {}),
+    remote: normalizeBrowserPanelOptions(repo?.browser_opts?.remote || {}),
+  };
+}
+
+function getBrowserState(direction) {
+  return direction === 'local' ? localBrowser : remoteBrowser;
+}
+
+function getBrowserSortLabel(sortBy, sortOrder) {
+  if (sortBy === 'time') return sortOrder === 'asc' ? '旧-新' : '新-旧';
+  if (sortBy === 'size') return sortOrder === 'asc' ? '小-大' : '大-小';
+  return sortOrder === 'asc' ? 'A-Z' : 'Z-A';
+}
+
+function syncRepoBrowserOptions(repo, direction, state) {
+  if (!repo) return;
+  const current = getRepoBrowserOptions(repo);
+  repo.browser_opts = {
+    local: {
+      sort_by: direction === 'local' ? state.sortBy : current.local.sortBy,
+      sort_order: direction === 'local' ? state.sortOrder : current.local.sortOrder,
+    },
+    remote: {
+      sort_by: direction === 'remote' ? state.sortBy : current.remote.sortBy,
+      sort_order: direction === 'remote' ? state.sortOrder : current.remote.sortOrder,
+    },
+  };
+}
 
 async function api(method, path, body) {
   const r = await fetch(path, {
@@ -1435,7 +1627,14 @@ function getSyncSelection() {
   };
 }
 
-function resetRemoteBrowserState(repoId = '', serverId = '', rootRemote = '', showHidden = remoteBrowser.showHidden) {
+function resetRemoteBrowserState(
+  repoId = '',
+  serverId = '',
+  rootRemote = '',
+  showHidden = remoteBrowser.showHidden,
+  sortBy = remoteBrowser.sortBy,
+  sortOrder = remoteBrowser.sortOrder,
+) {
   remoteBrowser = {
     repoId,
     serverId,
@@ -1446,6 +1645,8 @@ function resetRemoteBrowserState(repoId = '', serverId = '', rootRemote = '', sh
     loading: false,
     error: '',
     showHidden,
+    sortBy,
+    sortOrder,
     selectedPath: '',
     selectedType: '',
   };
@@ -1453,7 +1654,13 @@ function resetRemoteBrowserState(repoId = '', serverId = '', rootRemote = '', sh
   if (input) input.value = '';
 }
 
-function resetLocalBrowserState(repoId = '', rootLocal = '', showHidden = localBrowser.showHidden) {
+function resetLocalBrowserState(
+  repoId = '',
+  rootLocal = '',
+  showHidden = localBrowser.showHidden,
+  sortBy = localBrowser.sortBy,
+  sortOrder = localBrowser.sortOrder,
+) {
   localBrowser = {
     repoId,
     rootLocal,
@@ -1463,6 +1670,8 @@ function resetLocalBrowserState(repoId = '', rootLocal = '', showHidden = localB
     loading: false,
     error: '',
     showHidden,
+    sortBy,
+    sortOrder,
     selectedPath: '',
     selectedType: '',
   };
@@ -1482,10 +1691,14 @@ function handleSyncTargetChange(forceReload = false) {
   const localTargetChanged = localBrowser.repoId !== repoId;
   const remoteTargetChanged = remoteBrowser.repoId !== repoId || remoteBrowser.serverId !== serverId;
   const anyTargetChanged = localTargetChanged || remoteTargetChanged;
+  const browserOpts = repo ? getRepoBrowserOptions(repo) : {
+    local: { sortBy: 'name', sortOrder: 'asc' },
+    remote: { sortBy: 'name', sortOrder: 'asc' },
+  };
 
   if (!repo) {
-    resetLocalBrowserState(repoId, '');
-    resetRemoteBrowserState(repoId, serverId, '');
+    resetLocalBrowserState(repoId, '', localBrowser.showHidden, browserOpts.local.sortBy, browserOpts.local.sortOrder);
+    resetRemoteBrowserState(repoId, serverId, '', remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
     resetTransferQueues();
     renderLocalBrowser();
     renderRemoteBrowser();
@@ -1493,17 +1706,21 @@ function handleSyncTargetChange(forceReload = false) {
   }
 
   if (localTargetChanged) {
-    resetLocalBrowserState(repoId, repo.local);
+    resetLocalBrowserState(repoId, repo.local, localBrowser.showHidden, browserOpts.local.sortBy, browserOpts.local.sortOrder);
   } else {
     localBrowser.rootLocal = repo.local;
+    localBrowser.sortBy = browserOpts.local.sortBy;
+    localBrowser.sortOrder = browserOpts.local.sortOrder;
   }
 
   if (!server) {
-    resetRemoteBrowserState(repoId, serverId, repo.remote);
+    resetRemoteBrowserState(repoId, serverId, repo.remote, remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
   } else if (remoteTargetChanged) {
-    resetRemoteBrowserState(repoId, serverId, repo.remote);
+    resetRemoteBrowserState(repoId, serverId, repo.remote, remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
   } else {
     remoteBrowser.rootRemote = repo.remote;
+    remoteBrowser.sortBy = browserOpts.remote.sortBy;
+    remoteBrowser.sortOrder = browserOpts.remote.sortOrder;
   }
 
   if (anyTargetChanged) {
@@ -1530,9 +1747,10 @@ function handleSyncTargetChange(forceReload = false) {
 
 async function ensureRemoteBrowserLoaded(forceReload = false) {
   const { repoId, serverId, repo, server } = getSyncSelection();
+  const browserOpts = getRepoBrowserOptions(repo);
   if (!repo) {
-    resetLocalBrowserState(repoId, '');
-    resetRemoteBrowserState(repoId, serverId, '');
+    resetLocalBrowserState(repoId, '', localBrowser.showHidden, browserOpts.local.sortBy, browserOpts.local.sortOrder);
+    resetRemoteBrowserState(repoId, serverId, '', remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
     resetTransferQueues();
     renderLocalBrowser();
     renderRemoteBrowser();
@@ -1543,17 +1761,21 @@ async function ensureRemoteBrowserLoaded(forceReload = false) {
   const remoteTargetChanged = remoteBrowser.repoId !== repoId || remoteBrowser.serverId !== serverId;
 
   if (localTargetChanged) {
-    resetLocalBrowserState(repoId, repo.local);
+    resetLocalBrowserState(repoId, repo.local, localBrowser.showHidden, browserOpts.local.sortBy, browserOpts.local.sortOrder);
   } else {
     localBrowser.rootLocal = repo.local;
+    localBrowser.sortBy = browserOpts.local.sortBy;
+    localBrowser.sortOrder = browserOpts.local.sortOrder;
   }
 
   if (!server) {
-    resetRemoteBrowserState(repoId, serverId, repo.remote);
+    resetRemoteBrowserState(repoId, serverId, repo.remote, remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
   } else if (remoteTargetChanged) {
-    resetRemoteBrowserState(repoId, serverId, repo.remote);
+    resetRemoteBrowserState(repoId, serverId, repo.remote, remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
   } else {
     remoteBrowser.rootRemote = repo.remote;
+    remoteBrowser.sortBy = browserOpts.remote.sortBy;
+    remoteBrowser.sortOrder = browserOpts.remote.sortOrder;
   }
 
   if (forceReload || localTargetChanged || (!localBrowser.loading && !localBrowser.error && !localBrowser.entries.length)) {
@@ -1595,6 +1817,8 @@ async function loadLocalBrowser(relativePath = '', forceReload = false) {
     repo_id: repoId,
     relative_path: relativePath || '',
     show_hidden: localBrowser.showHidden,
+    sort_by: localBrowser.sortBy,
+    sort_order: localBrowser.sortOrder,
   });
 
   localBrowser.loading = false;
@@ -1636,6 +1860,8 @@ async function loadRemoteBrowser(relativePath = '', forceReload = false) {
     server_id: serverId,
     relative_path: relativePath || '',
     show_hidden: remoteBrowser.showHidden,
+    sort_by: remoteBrowser.sortBy,
+    sort_order: remoteBrowser.sortOrder,
   });
 
   remoteBrowser.loading = false;
@@ -1654,6 +1880,82 @@ async function loadRemoteBrowser(relativePath = '', forceReload = false) {
   renderRemoteBrowser();
 }
 
+function renderBrowserSortControls(direction, enabled) {
+  const state = getBrowserState(direction);
+  const sortByEl = document.getElementById(`${direction}-sort-by`);
+  const sortOrderBtn = document.getElementById(`${direction}-sort-order-btn`);
+  if (!sortByEl || !sortOrderBtn) return;
+  sortByEl.value = state.sortBy;
+  sortByEl.disabled = !enabled || state.loading;
+  sortOrderBtn.disabled = !enabled || state.loading;
+  sortOrderBtn.textContent = getBrowserSortLabel(state.sortBy, state.sortOrder);
+  sortOrderBtn.classList.toggle('is-desc', state.sortOrder === 'desc');
+}
+
+async function persistBrowserSort(direction) {
+  const { repoId, repo } = getSyncSelection();
+  if (!repoId || !repo) return true;
+  const state = getBrowserState(direction);
+  const res = await api('PUT', `/api/repos/${repoId}/browser-options`, {
+    direction,
+    sort_by: state.sortBy,
+    sort_order: state.sortOrder,
+  });
+  if (res.error) {
+    alert(`排序配置保存失败：${res.error}`);
+    return false;
+  }
+  if (res.browser_opts) {
+    repo.browser_opts = res.browser_opts;
+  } else {
+    syncRepoBrowserOptions(repo, direction, state);
+  }
+  return true;
+}
+
+async function reloadBrowserAfterSortChange(direction) {
+  if (direction === 'local') {
+    const { repo } = getSyncSelection();
+    if (!repo) {
+      renderLocalBrowser();
+      return;
+    }
+    await loadLocalBrowser(localBrowser.path || '', true);
+    return;
+  }
+
+  const { repo, server } = getSyncSelection();
+  if (!repo || !server) {
+    renderRemoteBrowser();
+    return;
+  }
+  await loadRemoteBrowser(remoteBrowser.path || '', true);
+}
+
+async function setBrowserSortBy(direction, sortBy) {
+  const state = getBrowserState(direction);
+  const previousSortBy = state.sortBy;
+  state.sortBy = normalizeBrowserPanelOptions({ sortBy, sortOrder: state.sortOrder }).sortBy;
+  if (!(await persistBrowserSort(direction))) {
+    state.sortBy = previousSortBy;
+    renderBrowserSortControls(direction, true);
+    return;
+  }
+  await reloadBrowserAfterSortChange(direction);
+}
+
+async function toggleBrowserSortOrder(direction) {
+  const state = getBrowserState(direction);
+  const previousSortOrder = state.sortOrder;
+  state.sortOrder = state.sortOrder === 'asc' ? 'desc' : 'asc';
+  if (!(await persistBrowserSort(direction))) {
+    state.sortOrder = previousSortOrder;
+    renderBrowserSortControls(direction, true);
+    return;
+  }
+  await reloadBrowserAfterSortChange(direction);
+}
+
 function renderRemoteBrowser() {
   const rootEl = document.getElementById('remote-browser-root');
   const pathEl = document.getElementById('remote-browser-path');
@@ -1669,6 +1971,7 @@ function renderRemoteBrowser() {
   showHiddenEl.checked = remoteBrowser.showHidden;
 
   const { repo, server } = getSyncSelection();
+  renderBrowserSortControls('remote', !!repo && !!server);
   if (!repo || !server) {
     pathEl.innerHTML = '<span class="inline-note">先选择仓库和服务器，再浏览远程目录。</span>';
     listEl.innerHTML = '<div class="empty">暂无可浏览的远程目录</div>';
@@ -1760,6 +2063,7 @@ function renderLocalBrowser() {
   showHiddenEl.checked = localBrowser.showHidden;
 
   const { repo } = getSyncSelection();
+  renderBrowserSortControls('local', !!repo);
   if (!repo) {
     pathEl.innerHTML = '<span class="inline-note">先选择仓库，再浏览本地目录。</span>';
     listEl.innerHTML = '<div class="empty">暂无可浏览的本地目录</div>';

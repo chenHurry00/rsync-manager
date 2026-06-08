@@ -27,6 +27,7 @@ python3 app.py
 - **定向上传** — 在本地浏览器中选择仓库根目录下的某个文件或目录，忽略排除规则手动上传到远端同相对路径
 - **定向回传** — 在远程浏览器中选择仓库根目录下的某个文件或目录，按相同相对路径回传到本地仓库
 - **隐藏项浏览** — 本地/远程浏览器都支持可选显示隐藏文件与隐藏目录
+- **浏览器排序** — 本地/远程浏览器都支持按名称、修改时间、文件大小排序，并可切换升序 / 降序
 - **多选队列** — 支持把多个上传项或回传项加入队列后顺序执行
 - **覆盖前探测** — 手动上传或回传前先探测目标是否已存在，确认后再执行
 - **同步选项** — 支持 `--delete`、`--dry-run` 预演、传输压缩、自动读取 `.gitignore` 排除规则
@@ -56,7 +57,11 @@ python3 app.py
       "name": "my-project",
       "local": "~/projects/my-project",
       "remote": "/opt/my-project",
-      "excludes": ["*.log", ".env", "node_modules/"]
+      "excludes": ["*.log", ".env", "node_modules/"],
+      "browser_opts": {
+        "local": { "sort_by": "name", "sort_order": "asc" },
+        "remote": { "sort_by": "time", "sort_order": "desc" }
+      }
     }
   ]
 }
@@ -76,6 +81,7 @@ python3 app.py
 - 实际上传：`/local/project/outputs/cache/model.bin` → `/remote/project/outputs/cache/model.bin`
 - 该功能忽略仓库级 `excludes` 和 `.gitignore`，只处理显式选择的路径
 - 浏览器支持“显示隐藏项”开关，可选择 `.gitkeep`、`.env.local` 一类隐藏文件
+- 浏览器工具栏支持按名称 / 时间 / 大小排序，并会把当前排序方式保存到配置文件
 - 如果远端目标已存在，会先弹出覆盖确认；目录存在时会提示“可能合并并覆盖其中内容”
 
 ## 定向回传说明
@@ -86,6 +92,7 @@ python3 app.py
 - 实际回传：`/remote/project/training/runs/exp42/best.pt` → `/local/project/training/runs/exp42/best.pt`
 - 浏览范围严格限制在仓库远端根目录内，不允许绝对路径和 `..`
 - 浏览器支持“显示隐藏项”开关，可按需查看隐藏日志或隐藏配置目录
+- 浏览器工具栏支持按名称 / 时间 / 大小排序，并会把当前排序方式保存到配置文件
 - 如果本地目标已存在，会先弹出覆盖确认；目录存在时会提示“可能合并并覆盖其中内容”
 
 ## SSH 免密配置
