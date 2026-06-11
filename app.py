@@ -40,7 +40,10 @@ def load_config() -> dict:
     CONFIG_FILE.parent.mkdir(exist_ok=True)
     if CONFIG_FILE.exists():
         try:
-            return json.loads(CONFIG_FILE.read_text())
+            cfg = json.loads(CONFIG_FILE.read_text())
+            # Auto-migrate old format to multi-target
+            cfg = _migrate_to_multi_target(cfg)
+            return cfg
         except Exception:
             pass
     return {"servers": [], "repos": [], "sync_history": []}
@@ -48,6 +51,96 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     CONFIG_FILE.parent.mkdir(exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+
+def _migrate_to_multi_target(cfg: dict) -> dict:
+    """Auto-migrate old single-target repos to multi-target structure"""
+    import re
+    from collections import defaultdict
+
+    repos = cfg.get("repos", [])
+    if not repos:
+        return cfg
+
+    # Check if already migrated
+    if any("targets" in r for r in repos):
+        return cfg
+
+    # Build server name map
+    server_map = {s["name"]: s["id"] for s in cfg.get("servers", [])}
+
+    # Group repos by base name
+    groups = defaultdict(list)
+    unmatched = []
+
+    for repo in repos:
+        name = repo.get("name", "")
+        # Try extract suffix: -ServerName
+        match = re.search(r'^(.+?)-([^-]+)$', name)
+        if match:
+            base, suffix = match.groups()
+            if suffix in server_map:
+                groups[base].append((repo, server_map[suffix]))
+                continue
+        unmatched.append((repo, None))
+
+    # Build new repos
+    new_repos = []
+
+    for base_name, items in groups.items():
+        # Check if all have same local path
+        locals = set(r["local"] for r, _ in items)
+        if len(locals) > 1:
+            # Different local paths, keep separate
+            for repo, sid in items:
+                unmatched.append((repo, sid))
+            continue
+
+        first = items[0][0]
+        new_repo = {
+            "id": first["id"],
+            "name": base_name,
+            "local": first["local"],
+            "targets": {}
+        }
+
+        for repo, sid in items:
+            target = {
+                "remote": repo["remote"],
+                "excludes": repo.get("excludes", [])
+            }
+            if "push_opts" in repo:
+                target["push_opts"] = repo["push_opts"]
+            if "browser_opts" in repo:
+                target["browser_opts"] = repo["browser_opts"]
+            new_repo["targets"][sid] = target
+
+        new_repos.append(new_repo)
+
+    # Keep unmatched as-is, convert to multi-target format
+    for repo, sid in unmatched:
+        if "targets" in repo:
+            new_repos.append(repo)
+        else:
+            # Convert to multi-target with unknown server
+            new_repo = {
+                "id": repo["id"],
+                "name": repo["name"],
+                "local": repo["local"],
+                "targets": {
+                    "_unknown_": {
+                        "remote": repo["remote"],
+                        "excludes": repo.get("excludes", [])
+                    }
+                }
+            }
+            if "push_opts" in repo:
+                new_repo["targets"]["_unknown_"]["push_opts"] = repo["push_opts"]
+            if "browser_opts" in repo:
+                new_repo["targets"]["_unknown_"]["browser_opts"] = repo["browser_opts"]
+            new_repos.append(new_repo)
+
+    cfg["repos"] = new_repos
+    return cfg
 
 VALID_BROWSER_SORT_FIELDS = {"name", "time", "size"}
 VALID_BROWSER_SORT_ORDERS = {"asc", "desc"}
@@ -179,9 +272,14 @@ def parse_relative_paths(raw_paths: list[str]) -> list[str]:
         raise ValueError("路径队列不能为空")
     return normalized_paths
 
-def get_repo_roots(repo: dict) -> tuple[str, str]:
+def get_repo_roots(repo: dict, server_id: str = None) -> tuple[str, str]:
     local_root = str(Path(repo["local"]).expanduser())
-    remote_root = repo["remote"].rstrip("/") or "/"
+    # Multi-target support
+    if "targets" in repo and server_id:
+        target = repo["targets"].get(server_id, {})
+        remote_root = target.get("remote", "/").rstrip("/") or "/"
+    else:
+        remote_root = repo.get("remote", "/").rstrip("/") or "/"
     return local_root, remote_root
 
 def format_remote_target(server: dict, path: str) -> str:
@@ -212,7 +310,7 @@ def build_rsync_cmd(repo: dict, server: dict, opts: dict) -> tuple[list[str], di
     mode = opts.get("mode", "push")
     prefix, ssh_parts, extra_env = build_transport(server)
     ssh_str = " ".join(shlex.quote(part) for part in ssh_parts)
-    local_root, remote_root = get_repo_roots(repo)
+    local_root, remote_root = get_repo_roots(repo, server["id"])
 
     cmd = prefix + ["rsync", "-avz", "--checksum"]
     if opts.get("dry_run"):
@@ -237,8 +335,10 @@ def build_rsync_cmd(repo: dict, server: dict, opts: dict) -> tuple[list[str], di
         # always exclude .git
         cmd += ["--exclude=.git/", "--exclude=*.log"]
 
-        # custom excludes
-        for ex in repo.get("excludes", []):
+        # custom excludes from target
+        target = repo.get("targets", {}).get(server["id"], {})
+        excludes = target.get("excludes", repo.get("excludes", []))
+        for ex in excludes:
             ex = ex.strip()
             if ex:
                 cmd += [f"--exclude={ex}"]
@@ -323,7 +423,7 @@ def browse_remote_entries(
     sort_order: str = "asc",
 ) -> dict:
     current_path = normalize_relative_remote_path(relative_path, allow_root=True)
-    _, remote_root = get_repo_roots(repo)
+    _, remote_root = get_repo_roots(repo, server["id"])
     remote_abs = remote_root if not current_path else posixpath.join(remote_root, current_path)
     hidden_filter = "" if show_hidden else "! -name '.*' "
     remote_cmd = f"""TARGET={shlex.quote(remote_abs)}
@@ -404,7 +504,7 @@ def probe_local_targets(repo: dict, relative_paths: list[str]) -> list[dict]:
     return results
 
 def probe_remote_targets(repo: dict, server: dict, relative_paths: list[str]) -> list[dict]:
-    _, remote_root = get_repo_roots(repo)
+    _, remote_root = get_repo_roots(repo, server["id"])
     checks = []
     for relative_path in relative_paths:
         target_path = posixpath.join(remote_root, relative_path)
@@ -523,8 +623,15 @@ def api_get_config():
         sc["has_password"] = bool(s.get("password_enc"))
         safe_servers.append(sc)
     cfg["servers"] = safe_servers
+
+    # Add browser_opts for each target
     for repo in cfg.get("repos", []):
-        repo["browser_opts"] = get_repo_browser_options(repo)
+        if "targets" in repo:
+            for sid, target in repo["targets"].items():
+                if "browser_opts" not in target:
+                    target["browser_opts"] = get_repo_browser_options({"browser_opts": target.get("browser_opts", {})})
+        else:
+            repo["browser_opts"] = get_repo_browser_options(repo)
     return jsonify(cfg)
 
 @app.route("/api/servers", methods=["POST"])
@@ -587,10 +694,15 @@ def api_add_repo():
         "id": str(int(time.time() * 1000)),
         "name": data["name"],
         "local": data["local"],
-        "remote": data["remote"],
-        "excludes": [e.strip() for e in data.get("excludes", "").split(",") if e.strip()],
-        "browser_opts": build_default_browser_options(),
+        "targets": {}
     }
+    # Add initial target if provided
+    if data.get("server_id") and data.get("remote"):
+        repo["targets"][data["server_id"]] = {
+            "remote": data["remote"],
+            "excludes": [e.strip() for e in data.get("excludes", "").split(",") if e.strip()],
+            "browser_opts": build_default_browser_options(),
+        }
     cfg["repos"].append(repo)
     save_config(cfg)
     return jsonify(repo)
@@ -609,26 +721,72 @@ def api_edit_repo(rid):
     data = request.json
     for r in cfg["repos"]:
         if r["id"] == rid:
-            r["name"]     = data["name"]
-            r["local"]    = data["local"]
-            r["remote"]   = data["remote"]
-            r["excludes"] = [e.strip() for e in data.get("excludes", "").split(",") if e.strip()]
-            r["browser_opts"] = get_repo_browser_options(r)
+            r["name"] = data["name"]
+            r["local"] = data["local"]
+            # Update targets if provided
+            if "targets" in data:
+                r["targets"] = data["targets"]
             break
     save_config(cfg)
     return jsonify({"ok": True})
+
+@app.route("/api/repos/<rid>/targets/<sid>", methods=["PUT"])
+def api_update_repo_target(rid, sid):
+    cfg = load_config()
+    data = request.json
+    for r in cfg["repos"]:
+        if r["id"] == rid:
+            if "targets" not in r:
+                r["targets"] = {}
+            r["targets"][sid] = {
+                "remote": data["remote"],
+                "excludes": [e.strip() for e in data.get("excludes", "").split(",") if e.strip()],
+            }
+            if "push_opts" in data:
+                r["targets"][sid]["push_opts"] = data["push_opts"]
+            if "browser_opts" in data:
+                r["targets"][sid]["browser_opts"] = data["browser_opts"]
+            save_config(cfg)
+            return jsonify({"ok": True})
+    return jsonify({"error": "repo not found"}), 404
+
+@app.route("/api/repos/<rid>/targets/<sid>", methods=["DELETE"])
+def api_delete_repo_target(rid, sid):
+    cfg = load_config()
+    for r in cfg["repos"]:
+        if r["id"] == rid:
+            if "targets" in r and sid in r["targets"]:
+                del r["targets"][sid]
+                save_config(cfg)
+                return jsonify({"ok": True})
+    return jsonify({"error": "target not found"}), 404
 
 @app.route("/api/repos/<rid>/browser-options", methods=["PUT"])
 def api_save_repo_browser_options(rid):
     cfg = load_config()
     data = request.json or {}
     direction = data.get("direction")
+    server_id = data.get("server_id")
     if direction not in {"local", "remote"}:
         return jsonify({"error": "invalid browser direction"}), 400
 
     for repo in cfg["repos"]:
         if repo["id"] != rid:
             continue
+
+        # Multi-target support
+        if "targets" in repo and server_id:
+            target = repo["targets"].get(server_id, {})
+            if "browser_opts" not in target:
+                target["browser_opts"] = build_default_browser_options()
+            target["browser_opts"][direction] = normalize_browser_sort_options(
+                data.get("sort_by", "name"),
+                data.get("sort_order", "asc"),
+            )
+            save_config(cfg)
+            return jsonify({"browser_opts": target["browser_opts"]})
+
+        # Legacy support
         browser_opts = get_repo_browser_options(repo)
         browser_opts[direction] = normalize_browser_sort_options(
             data.get("sort_by", "name"),
@@ -648,6 +806,10 @@ def api_sync():
     if not repo or not server:
         return jsonify({"error": "repo or server not found"}), 404
 
+    # Check if target exists for multi-target repos
+    if "targets" in repo and server["id"] not in repo["targets"]:
+        return jsonify({"error": "该仓库未配置此服务器的同步目标"}), 400
+
     push_opts = {
         "delete": data.get("delete", False),
         "dry_run": data.get("dry_run", False),
@@ -655,7 +817,11 @@ def api_sync():
         "gitignore": data.get("gitignore", True),
     }
     if not push_opts["dry_run"]:
-        repo["push_opts"] = {k: v for k, v in push_opts.items() if k != "dry_run"}
+        # Save to target if multi-target
+        if "targets" in repo and server["id"] in repo["targets"]:
+            repo["targets"][server["id"]]["push_opts"] = {k: v for k, v in push_opts.items() if k != "dry_run"}
+        else:
+            repo["push_opts"] = {k: v for k, v in push_opts.items() if k != "dry_run"}
         save_config(cfg)
 
     job_id = str(int(time.time() * 1000))
@@ -741,7 +907,7 @@ def api_remote_browse():
             data.get("sort_by", "name"),
             data.get("sort_order", "asc"),
         )
-        result["remote_root"] = get_repo_roots(repo)[1]
+        result["remote_root"] = get_repo_roots(repo, server["id"])[1]
         return jsonify(result)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -832,7 +998,16 @@ def api_generate_script():
     if not repo or not server:
         return jsonify({"error": "not found"}), 404
 
-    excludes = "\n".join(f'    --exclude="{e}" \\' for e in repo.get("excludes", []) if e)
+    # Get excludes from target if multi-target
+    if "targets" in repo and server["id"] in repo["targets"]:
+        target = repo["targets"][server["id"]]
+        remote_path = target["remote"]
+        excludes_list = target.get("excludes", [])
+    else:
+        remote_path = repo.get("remote", "/opt/unknown")
+        excludes_list = repo.get("excludes", [])
+
+    excludes = "\n".join(f'    --exclude="{e}" \\' for e in excludes_list if e)
     script = f'''#!/bin/bash
 # CodeSync — Auto-generated sync script
 # Repo   : {repo["name"]}
@@ -843,7 +1018,7 @@ set -euo pipefail
 
 REPO_NAME="{repo["name"]}"
 LOCAL_PATH="{repo["local"].rstrip("/")}/"
-REMOTE_PATH="{server["user"]}@{server["host"]}:{repo["remote"]}"
+REMOTE_PATH="{server["user"]}@{server["host"]}:{remote_path}"
 SSH_KEY="{server.get("key", "~/.ssh/id_rsa")}"
 SSH_PORT="{server.get("port", 22)}"
 
@@ -1387,8 +1562,10 @@ tr:last-child td { border-bottom: none; }
     <div class="modal-title">添加仓库</div>
     <div class="form-row"><div class="field"><label>仓库名称</label><input id="nr-name" placeholder="my-project" type="text"></div></div>
     <div class="form-row"><div class="field"><label>本地路径</label><input id="nr-local" placeholder="/Users/me/projects/my-project" type="text"></div></div>
+    <div class="card-title" style="margin-top:16px;">初始同步目标（可选）</div>
+    <div class="form-row"><div class="field"><label>服务器</label><select id="nr-server"><option value="">— 稍后添加 —</option></select></div></div>
     <div class="form-row"><div class="field"><label>远程路径</label><input id="nr-remote" placeholder="/opt/my-project" type="text"></div></div>
-    <div class="form-row"><div class="field"><label>额外排除规则（逗号分隔，支持 glob）</label><input id="nr-excludes" placeholder="*.log, .env, node_modules/, vendor/" type="text"></div></div>
+    <div class="form-row"><div class="field"><label>排除规则（逗号分隔）</label><input id="nr-excludes" placeholder="*.log, .env" type="text"></div></div>
     <div class="modal-footer">
       <button class="btn" onclick="closeModal('modal-add-repo')">取消</button>
       <button class="btn btn-green" onclick="addRepo()">添加</button>
@@ -1494,9 +1671,19 @@ function renderAll() {
   renderServerPage();
   renderRepoPage();
   populateSelects();
+  populateAddRepoServerList();
   renderTransferQueue('push');
   renderTransferQueue('pull');
   handleSyncTargetChange(false);
+}
+
+function populateAddRepoServerList() {
+  const el = document.getElementById('nr-server');
+  if (!el) return;
+  el.innerHTML = '<option value="">— 稍后添加 —</option>' +
+    (cfg.servers.length ? cfg.servers.map(s =>
+      `<option value="${s.id}">${esc(s.name)} (${esc(s.host)})</option>`
+    ).join('') : '');
 }
 
 // Navigation
@@ -1532,15 +1719,17 @@ function renderOverview() {
     </div>`).join('') : '<div class="empty">暂无服务器</div>';
 
   const rl = document.getElementById('ov-repo-list');
-  rl.innerHTML = cfg.repos.length ? cfg.repos.map(r => `
+  rl.innerHTML = cfg.repos.length ? cfg.repos.map(r => {
+    const targetCount = r.targets ? Object.keys(r.targets).length : 0;
+    return `
     <div class="item">
       <div class="item-dot" style="background:var(--blue)"></div>
       <div class="item-body">
         <div class="item-name">${esc(r.name)}</div>
-        <div class="item-sub">${esc(r.local)}</div>
+        <div class="item-sub">${esc(r.local)} · ${targetCount} 个目标服务器</div>
       </div>
-      <button class="btn btn-sm" onclick="quickSync('${r.id}')">同步</button>
-    </div>`).join('') : '<div class="empty">暂无仓库</div>';
+    </div>`;
+  }).join('') : '<div class="empty">暂无仓库</div>';
 }
 
 function renderServerPage() {
@@ -1567,19 +1756,27 @@ function renderServerPage() {
 
 function renderRepoPage() {
   const el = document.getElementById('repo-card');
-  el.innerHTML = cfg.repos.length ? cfg.repos.map(r => `
+  el.innerHTML = cfg.repos.length ? cfg.repos.map(r => {
+    const targets = r.targets || {};
+    const targetCount = Object.keys(targets).length;
+    const targetList = Object.entries(targets).map(([sid, t]) => {
+      const server = cfg.servers.find(s => s.id === sid);
+      const serverName = server ? server.name : sid;
+      return `<span class="badge badge-gray" style="font-size:9px;">${esc(serverName)}</span>`;
+    }).join(' ');
+    return `
     <div class="item">
       <div class="item-dot" style="background:var(--blue)"></div>
       <div class="item-body">
         <div class="item-name">${esc(r.name)}</div>
-        <div class="item-sub">${esc(r.local)} → ${esc(r.remote)}</div>
+        <div class="item-sub">${esc(r.local)} · ${targetCount} 个目标 ${targetList}</div>
       </div>
       <div class="row-actions">
-        <span class="badge badge-gray" style="font-size:9px;">${(r.excludes||[]).length} 排除规则</span>
         <button class="btn btn-sm" title="编辑" onclick="openEditRepo('${r.id}')">编辑</button>
         <button class="btn btn-icon danger" title="删除" onclick="deleteRepo('${r.id}')">✕</button>
       </div>
-    </div>`).join('') : '<div class="empty">暂无仓库</div>';
+    </div>`;
+  }).join('') : '<div class="empty">暂无仓库</div>';
 }
 
 function populateSelects() {
@@ -1588,25 +1785,59 @@ function populateSelects() {
   const currentScriptRepo = document.getElementById('script-repo')?.value || '';
   const currentScriptServer = document.getElementById('script-server')?.value || '';
 
-  ['sync-repo','script-repo'].forEach(id => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.innerHTML = cfg.repos.length
-      ? cfg.repos.map(r => `<option value="${r.id}">${esc(r.name)}</option>`).join('')
-      : '<option>— 暂无仓库 —</option>';
-  });
-  ['sync-server','script-server'].forEach(id => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.innerHTML = cfg.servers.length
+  // Sync server list - always show all
+  const syncServerEl = document.getElementById('sync-server');
+  if (syncServerEl) {
+    syncServerEl.innerHTML = cfg.servers.length
       ? cfg.servers.map(s => `<option value="${s.id}">${esc(s.name)} (${esc(s.host)})</option>`).join('')
       : '<option>— 暂无服务器 —</option>';
-  });
+    // Restore server selection first
+    if (currentSyncServer) {
+      const hasOption = Array.from(syncServerEl.options).some(opt => opt.value === currentSyncServer);
+      if (hasOption) syncServerEl.value = currentSyncServer;
+    }
+  }
 
-  restoreSelectValue('sync-repo', currentSyncRepo);
-  restoreSelectValue('sync-server', currentSyncServer);
-  restoreSelectValue('script-repo', currentScriptRepo);
-  restoreSelectValue('script-server', currentScriptServer);
+  // Sync repo list - filter by selected server (use restored value)
+  const syncServerId = document.getElementById('sync-server')?.value;
+  const syncRepoEl = document.getElementById('sync-repo');
+  if (syncRepoEl) {
+    let filteredRepos = cfg.repos;
+    if (syncServerId) {
+      filteredRepos = cfg.repos.filter(r => r.targets && r.targets[syncServerId]);
+    }
+    syncRepoEl.innerHTML = filteredRepos.length
+      ? filteredRepos.map(r => `<option value="${r.id}">${esc(r.name)}</option>`).join('')
+      : '<option>— 该服务器未配置仓库 —</option>';
+    // Restore repo selection
+    if (currentSyncRepo) {
+      const hasOption = Array.from(syncRepoEl.options).some(opt => opt.value === currentSyncRepo);
+      if (hasOption) syncRepoEl.value = currentSyncRepo;
+    }
+  }
+
+  // Script lists - show all
+  const scriptRepoEl = document.getElementById('script-repo');
+  if (scriptRepoEl) {
+    scriptRepoEl.innerHTML = cfg.repos.length
+      ? cfg.repos.map(r => `<option value="${r.id}">${esc(r.name)}</option>`).join('')
+      : '<option>— 暂无仓库 —</option>';
+    if (currentScriptRepo) {
+      const hasOption = Array.from(scriptRepoEl.options).some(opt => opt.value === currentScriptRepo);
+      if (hasOption) scriptRepoEl.value = currentScriptRepo;
+    }
+  }
+
+  const scriptServerEl = document.getElementById('script-server');
+  if (scriptServerEl) {
+    scriptServerEl.innerHTML = cfg.servers.length
+      ? cfg.servers.map(s => `<option value="${s.id}">${esc(s.name)} (${esc(s.host)})</option>`).join('')
+      : '<option>— 暂无服务器 —</option>';
+    if (currentScriptServer) {
+      const hasOption = Array.from(scriptServerEl.options).some(opt => opt.value === currentScriptServer);
+      if (hasOption) scriptServerEl.value = currentScriptServer;
+    }
+  }
 }
 
 function restoreSelectValue(id, value) {
@@ -1687,14 +1918,24 @@ function resetTransferQueues() {
 }
 
 function handleSyncTargetChange(forceReload = false) {
+  // Re-populate selects to apply filters
+  populateSelects();
+
   const { repoId, serverId, repo, server } = getSyncSelection();
   const localTargetChanged = localBrowser.repoId !== repoId;
   const remoteTargetChanged = remoteBrowser.repoId !== repoId || remoteBrowser.serverId !== serverId;
   const anyTargetChanged = localTargetChanged || remoteTargetChanged;
-  const browserOpts = repo ? getRepoBrowserOptions(repo) : {
-    local: { sortBy: 'name', sortOrder: 'asc' },
-    remote: { sortBy: 'name', sortOrder: 'asc' },
-  };
+
+  // Get browser options from target if multi-target
+  let browserOpts = { local: { sortBy: 'name', sortOrder: 'asc' }, remote: { sortBy: 'name', sortOrder: 'asc' } };
+  if (repo) {
+    if (repo.targets && server && repo.targets[server.id]) {
+      const target = repo.targets[server.id];
+      browserOpts = target.browser_opts ? getRepoBrowserOptions({browser_opts: target.browser_opts}) : browserOpts;
+    } else {
+      browserOpts = getRepoBrowserOptions(repo);
+    }
+  }
 
   if (!repo) {
     resetLocalBrowserState(repoId, '', localBrowser.showHidden, browserOpts.local.sortBy, browserOpts.local.sortOrder);
@@ -1714,11 +1955,20 @@ function handleSyncTargetChange(forceReload = false) {
   }
 
   if (!server) {
-    resetRemoteBrowserState(repoId, serverId, repo.remote, remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
+    const remoteRoot = repo.targets && Object.keys(repo.targets).length > 0
+      ? Object.values(repo.targets)[0].remote
+      : (repo.remote || '/');
+    resetRemoteBrowserState(repoId, serverId, remoteRoot, remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
   } else if (remoteTargetChanged) {
-    resetRemoteBrowserState(repoId, serverId, repo.remote, remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
+    const remoteRoot = repo.targets && repo.targets[server.id]
+      ? repo.targets[server.id].remote
+      : (repo.remote || '/');
+    resetRemoteBrowserState(repoId, serverId, remoteRoot, remoteBrowser.showHidden, browserOpts.remote.sortBy, browserOpts.remote.sortOrder);
   } else {
-    remoteBrowser.rootRemote = repo.remote;
+    const remoteRoot = repo.targets && repo.targets[server.id]
+      ? repo.targets[server.id].remote
+      : (repo.remote || '/');
+    remoteBrowser.rootRemote = remoteRoot;
     remoteBrowser.sortBy = browserOpts.remote.sortBy;
     remoteBrowser.sortOrder = browserOpts.remote.sortOrder;
   }
@@ -1738,8 +1988,14 @@ function handleSyncTargetChange(forceReload = false) {
   }
 
   if (anyTargetChanged && repo) {
-    const opts = repo.push_opts || {};
-    document.getElementById('opt-delete').checked  = opts.delete   ?? false;
+    // Load push_opts from target if available
+    let opts = { delete: false, compress: true, gitignore: true };
+    if (repo.targets && server && repo.targets[server.id]) {
+      opts = repo.targets[server.id].push_opts || opts;
+    } else if (repo.push_opts) {
+      opts = repo.push_opts;
+    }
+    document.getElementById('opt-delete').checked = opts.delete ?? false;
     document.getElementById('opt-compress').checked = opts.compress ?? true;
     document.getElementById('opt-gitignore').checked = opts.gitignore ?? true;
   }
@@ -1893,11 +2149,12 @@ function renderBrowserSortControls(direction, enabled) {
 }
 
 async function persistBrowserSort(direction) {
-  const { repoId, repo } = getSyncSelection();
+  const { repoId, repo, server } = getSyncSelection();
   if (!repoId || !repo) return true;
   const state = getBrowserState(direction);
   const res = await api('PUT', `/api/repos/${repoId}/browser-options`, {
     direction,
+    server_id: server ? server.id : undefined,
     sort_by: state.sortBy,
     sort_order: state.sortOrder,
   });
@@ -1906,7 +2163,11 @@ async function persistBrowserSort(direction) {
     return false;
   }
   if (res.browser_opts) {
-    repo.browser_opts = res.browser_opts;
+    if (repo.targets && server && repo.targets[server.id]) {
+      repo.targets[server.id].browser_opts = res.browser_opts;
+    } else {
+      repo.browser_opts = res.browser_opts;
+    }
   } else {
     syncRepoBrowserOptions(repo, direction, state);
   }
@@ -2386,15 +2647,158 @@ async function addServer() {
 async function addRepo() {
   const name = document.getElementById('nr-name').value.trim();
   const local = document.getElementById('nr-local').value.trim();
+  if (!name || !local) return alert('名称和本地路径不能为空');
+
+  const serverId = document.getElementById('nr-server').value;
   const remote = document.getElementById('nr-remote').value.trim();
-  if (!name || !local || !remote) return alert('名称、本地路径、远程路径不能为空');
+
   await api('POST', '/api/repos', {
-    name, local, remote,
+    name, local,
+    server_id: serverId || undefined,
+    remote: remote || undefined,
     excludes: document.getElementById('nr-excludes').value,
   });
   closeModal('modal-add-repo');
-  ['nr-name','nr-local','nr-remote','nr-excludes'].forEach(id => document.getElementById(id).value = '');
+  ['nr-name','nr-local','nr-server','nr-remote','nr-excludes'].forEach(id => document.getElementById(id).value = '');
   await loadAll();
+}
+
+function openEditRepo(id) {
+  const r = cfg.repos.find(x => x.id === id);
+  if (!r) return;
+  document.getElementById('er-id').value = r.id;
+  document.getElementById('er-name').value = r.name;
+  document.getElementById('er-local').value = r.local;
+
+  // Render targets
+  const targetsList = document.getElementById('er-targets-list');
+  const targets = r.targets || {};
+  if (Object.keys(targets).length === 0) {
+    targetsList.innerHTML = '<div class="empty" style="padding:10px 0;">暂无同步目标</div>';
+  } else {
+    targetsList.innerHTML = Object.entries(targets).map(([sid, target]) => {
+      const server = cfg.servers.find(s => s.id === sid);
+      const serverName = server ? server.name : sid;
+      const excludeCount = (target.excludes || []).length;
+      return `
+        <div class="item" style="margin-bottom:8px;">
+          <div class="item-dot" style="background:var(--green)"></div>
+          <div class="item-body">
+            <div class="item-name">${esc(serverName)}</div>
+            <div class="item-sub">${esc(target.remote)} · ${excludeCount} 个排除规则</div>
+          </div>
+          <div class="row-actions">
+            <button class="btn btn-sm" onclick="openEditTarget('${r.id}', '${sid}')">编辑</button>
+            <button class="btn btn-icon danger" onclick="deleteTarget('${r.id}', '${sid}')">✕</button>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  openModal('modal-edit-repo');
+}
+
+async function saveRepo() {
+  const id = document.getElementById('er-id').value;
+  const name = document.getElementById('er-name').value.trim();
+  const local = document.getElementById('er-local').value.trim();
+  if (!name || !local) return alert('名称和本地路径不能为空');
+
+  const repo = cfg.repos.find(r => r.id === id);
+  await api('PUT', `/api/repos/${id}`, {
+    name, local,
+    targets: repo?.targets || {}
+  });
+  closeModal('modal-edit-repo');
+  await loadAll();
+}
+
+function openAddTarget() {
+  const repoId = document.getElementById('er-id').value;
+  const repo = cfg.repos.find(r => r.id === repoId);
+  if (!repo) return;
+
+  document.getElementById('at-repo-id').value = repoId;
+
+  // Populate server list (exclude already added)
+  const existingServerIds = Object.keys(repo.targets || {});
+  const availableServers = cfg.servers.filter(s => !existingServerIds.includes(s.id));
+
+  const serverEl = document.getElementById('at-server');
+  if (availableServers.length === 0) {
+    serverEl.innerHTML = '<option>— 所有服务器已添加 —</option>';
+  } else {
+    serverEl.innerHTML = availableServers.map(s =>
+      `<option value="${s.id}">${esc(s.name)} (${esc(s.host)})</option>`
+    ).join('');
+  }
+
+  document.getElementById('at-remote').value = '';
+  document.getElementById('at-excludes').value = '';
+  openModal('modal-add-target');
+}
+
+async function addTarget() {
+  const repoId = document.getElementById('at-repo-id').value;
+  const serverId = document.getElementById('at-server').value;
+  const remote = document.getElementById('at-remote').value.trim();
+
+  if (!serverId || !remote) return alert('请选择服务器并填写远程路径');
+
+  await api('PUT', `/api/repos/${repoId}/targets/${serverId}`, {
+    remote,
+    excludes: document.getElementById('at-excludes').value,
+  });
+
+  closeModal('modal-add-target');
+  await loadAll();
+  openEditRepo(repoId);
+}
+
+function openEditTarget(repoId, serverId) {
+  const repo = cfg.repos.find(r => r.id === repoId);
+  if (!repo || !repo.targets || !repo.targets[serverId]) return;
+
+  const target = repo.targets[serverId];
+  const server = cfg.servers.find(s => s.id === serverId);
+
+  document.getElementById('et-repo-id').value = repoId;
+  document.getElementById('et-server-id').value = serverId;
+  document.getElementById('et-title').textContent = `编辑同步目标：${server ? server.name : serverId}`;
+
+  const serverEl = document.getElementById('et-server');
+  serverEl.innerHTML = `<option value="${serverId}">${esc(server ? server.name : serverId)}</option>`;
+  serverEl.value = serverId;
+
+  document.getElementById('et-remote').value = target.remote || '';
+  document.getElementById('et-excludes').value = (target.excludes || []).join(', ');
+
+  openModal('modal-edit-target');
+}
+
+async function saveTarget() {
+  const repoId = document.getElementById('et-repo-id').value;
+  const serverId = document.getElementById('et-server-id').value;
+  const remote = document.getElementById('et-remote').value.trim();
+
+  if (!remote) return alert('远程路径不能为空');
+
+  await api('PUT', `/api/repos/${repoId}/targets/${serverId}`, {
+    remote,
+    excludes: document.getElementById('et-excludes').value,
+  });
+
+  closeModal('modal-edit-target');
+  await loadAll();
+  openEditRepo(repoId);
+}
+
+async function deleteTarget(repoId, serverId) {
+  if (!confirm('确认删除该同步目标？')) return;
+
+  await api('DELETE', `/api/repos/${repoId}/targets/${serverId}`);
+  await loadAll();
+  openEditRepo(repoId);
 }
 
 async function deleteServer(id) {
@@ -2726,31 +3130,6 @@ async function saveServer() {
   await loadAll();
 }
 
-function openEditRepo(id) {
-  const r = cfg.repos.find(x => x.id === id);
-  if (!r) return;
-  document.getElementById('er-id').value       = r.id;
-  document.getElementById('er-name').value     = r.name;
-  document.getElementById('er-local').value    = r.local;
-  document.getElementById('er-remote').value   = r.remote;
-  document.getElementById('er-excludes').value = (r.excludes || []).join(', ');
-  openModal('modal-edit-repo');
-}
-
-async function saveRepo() {
-  const id     = document.getElementById('er-id').value;
-  const name   = document.getElementById('er-name').value.trim();
-  const local  = document.getElementById('er-local').value.trim();
-  const remote = document.getElementById('er-remote').value.trim();
-  if (!name || !local || !remote) return alert('名称、本地路径、远程路径不能为空');
-  await api('PUT', `/api/repos/${id}`, {
-    name, local, remote,
-    excludes: document.getElementById('er-excludes').value,
-  });
-  closeModal('modal-edit-repo');
-  await loadAll();
-}
-
 loadAll();
 </script>
 
@@ -2791,16 +3170,48 @@ loadAll();
 
 <!-- Edit Repo Modal -->
 <div class="modal-overlay" id="modal-edit-repo">
-  <div class="modal">
+  <div class="modal" style="width:600px;max-width:95vw;">
     <div class="modal-title">编辑仓库</div>
     <input type="hidden" id="er-id">
     <div class="form-row"><div class="field"><label>仓库名称</label><input id="er-name" type="text"></div></div>
     <div class="form-row"><div class="field"><label>本地路径</label><input id="er-local" type="text"></div></div>
-    <div class="form-row"><div class="field"><label>远程路径</label><input id="er-remote" type="text"></div></div>
-    <div class="form-row"><div class="field"><label>额外排除规则（逗号分隔）</label><input id="er-excludes" type="text" placeholder="*.log, .env, node_modules/"></div></div>
+    <div class="card-title" style="margin-top:16px;">同步目标</div>
+    <div id="er-targets-list"></div>
+    <button class="btn btn-sm" style="margin-top:10px;" onclick="openAddTarget()">+ 添加目标服务器</button>
     <div class="modal-footer">
       <button class="btn" onclick="closeModal('modal-edit-repo')">取消</button>
       <button class="btn btn-green" onclick="saveRepo()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Target Modal -->
+<div class="modal-overlay" id="modal-edit-target">
+  <div class="modal">
+    <div class="modal-title" id="et-title">编辑同步目标</div>
+    <input type="hidden" id="et-repo-id">
+    <input type="hidden" id="et-server-id">
+    <div class="form-row"><div class="field"><label>服务器</label><select id="et-server" disabled></select></div></div>
+    <div class="form-row"><div class="field"><label>远程路径</label><input id="et-remote" type="text"></div></div>
+    <div class="form-row"><div class="field"><label>排除规则（逗号分隔）</label><input id="et-excludes" type="text"></div></div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('modal-edit-target')">取消</button>
+      <button class="btn btn-green" onclick="saveTarget()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Target Modal -->
+<div class="modal-overlay" id="modal-add-target">
+  <div class="modal">
+    <div class="modal-title">添加同步目标</div>
+    <input type="hidden" id="at-repo-id">
+    <div class="form-row"><div class="field"><label>服务器</label><select id="at-server"></select></div></div>
+    <div class="form-row"><div class="field"><label>远程路径</label><input id="at-remote" type="text"></div></div>
+    <div class="form-row"><div class="field"><label>排除规则（逗号分隔）</label><input id="at-excludes" type="text"></div></div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('modal-add-target')">取消</button>
+      <button class="btn btn-green" onclick="addTarget()">添加</button>
     </div>
   </div>
 </div>
