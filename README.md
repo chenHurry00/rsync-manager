@@ -27,7 +27,7 @@ CODESYNC_PORT=8899 python3 app.py
 
 ## systemd 服务管理（Linux）
 
-仓库提供 `scripts/codesync-service.sh`，可自动创建项目内 `.venv`、安装依赖并注册 systemd 服务。直接运行脚本会进入交互式 TUI 菜单，也可以传入命令执行。首次安装需要当前用户具备 `sudo` 权限，以及 `python3-venv` 和 `rsync`；请直接以当前用户执行脚本，脚本会在需要时调用 `sudo`：
+仓库提供 `scripts/codesync-service.sh`，可自动创建项目内 `.venv`、安装依赖并注册 systemd 服务。直接运行脚本会进入交互式 TUI 菜单，也可以传入命令执行。首次安装需要当前用户具备 `sudo` 权限，以及 `python3-venv` 和 `rsync`；脚本会在 Debian/Ubuntu、Fedora/RHEL 和 Arch Linux 上自动安装 `sshpass`。请直接以当前用户执行脚本，脚本会在需要时调用 `sudo`：
 
 ```bash
 # 一键创建环境、安装依赖、注册并启动服务
@@ -54,6 +54,12 @@ CODESYNC_PORT=8899 ./scripts/codesync-service.sh install
 ```
 
 如需更换服务名，可设置 `CODESYNC_SERVICE_NAME`。TUI 中使用方向键或 `j/k` 移动，按 Enter 执行，按 `q` 退出；卸载操作会再次确认。
+
+## SSH 连接检查与密钥自动安装
+
+添加或编辑服务器时，保存前会先检查 SSH 连接。密码认证会使用本机的 `sshpass`；密码通过环境变量传给 SSH，不会出现在命令行参数中。
+
+选择“SSH 密钥”时，可以填写“首次安装公钥的登录密码”。系统会使用该密码连接一次，把本机公钥加入远端 `~/.ssh/authorized_keys`，再用密钥复测连接。此密码只用于本次操作，不会写入 CodeSync 配置。
 
 ## 功能
 

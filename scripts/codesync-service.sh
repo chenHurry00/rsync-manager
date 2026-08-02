@@ -216,6 +216,27 @@ require_commands() {
   done
 }
 
+ensure_sshpass() {
+  if command -v sshpass >/dev/null 2>&1; then
+    return
+  fi
+
+  log '未检测到 sshpass，正在安装密码认证所需依赖'
+  if command -v apt-get >/dev/null 2>&1; then
+    run_root apt-get update
+    run_root apt-get install -y sshpass
+  elif command -v dnf >/dev/null 2>&1; then
+    run_root dnf install -y sshpass
+  elif command -v yum >/dev/null 2>&1; then
+    run_root yum install -y sshpass
+  elif command -v pacman >/dev/null 2>&1; then
+    run_root pacman -S --needed --noconfirm sshpass
+  else
+    die '无法自动安装 sshpass，请使用系统包管理器安装后重试'
+  fi
+  require_commands sshpass
+}
+
 require_privileges() {
   if [[ "${EUID}" -ne 0 ]]; then
     require_commands sudo
@@ -280,6 +301,7 @@ install_service() {
   [[ "$(uname -s)" == "Linux" ]] || die "当前脚本仅支持 Linux systemd"
   require_privileges
   require_commands systemctl getent rsync
+  ensure_sshpass
   validate_port "${SERVICE_PORT}"
   write_unit_file
 

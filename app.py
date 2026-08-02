@@ -12,6 +12,7 @@ import json
 import os
 import posixpath
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -305,6 +306,92 @@ def build_ssh_cmd(server: dict, remote_command: str) -> tuple[list[str], dict]:
     prefix, ssh_parts, extra_env = build_transport(server)
     target = f"{server['user']}@{server['host']}"
     return prefix + ssh_parts + [target, remote_command], extra_env
+
+
+def _run_ssh_check(server: dict) -> None:
+    """Verify SSH authentication without exposing passwords to the caller."""
+    if server.get("auth_mode") == "password" and not shutil.which("sshpass"):
+        raise FileNotFoundError("sshpass")
+    if not shutil.which("ssh"):
+        raise FileNotFoundError("ssh")
+
+    cmd, extra_env = build_ssh_cmd(server, "printf '__CODESYNC_SSH_OK__\\n'")
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, **extra_env},
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "SSH 连接失败").strip()
+        raise RuntimeError(detail[-500:])
+    if "__CODESYNC_SSH_OK__" not in proc.stdout:
+        raise RuntimeError("SSH 连接检查未返回预期结果")
+
+
+def _resolve_private_key_path(raw_key: str) -> Path:
+    candidates = []
+    if raw_key.strip():
+        candidates.append(Path(raw_key).expanduser())
+    else:
+        candidates.extend(
+            Path.home() / name
+            for name in (".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa")
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise ValueError("找不到 SSH 私钥，请填写私钥路径")
+
+
+def _read_public_key(private_key: Path) -> str:
+    public_key_file = Path(f"{private_key}.pub")
+    if public_key_file.is_file():
+        for line in public_key_file.read_text().splitlines():
+            if line.strip() and not line.lstrip().startswith("#"):
+                public_key = line.strip()
+                if len(public_key.split()) >= 2:
+                    return public_key
+
+    result = subprocess.run(
+        ["ssh-keygen", "-y", "-f", str(private_key)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError("无法从私钥生成公钥，请确认私钥可读取且未要求交互式口令")
+    public_key = result.stdout.strip().splitlines()[0]
+    if len(public_key.split()) < 2:
+        raise RuntimeError("本机 SSH 公钥格式无效")
+    return public_key
+
+
+def _install_public_key(server: dict, public_key: str, password: str) -> None:
+    if not shutil.which("sshpass"):
+        raise FileNotFoundError("sshpass")
+    if not password:
+        raise ValueError("请输入用于首次登录的 SSH 密码")
+
+    password_server = {**server, "auth_mode": "password", "key": "", "password_enc": _obfuscate(password)}
+    quoted_key = shlex.quote(public_key)
+    remote_command = (
+        "set -eu; umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; "
+        f"grep -Fqx {quoted_key} ~/.ssh/authorized_keys || printf '%s\\n' {quoted_key} >> ~/.ssh/authorized_keys; "
+        "chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys"
+    )
+    cmd, extra_env = build_ssh_cmd(password_server, remote_command)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env={**os.environ, **extra_env},
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "公钥安装失败").strip()
+        raise RuntimeError(detail[-500:])
 
 def record_sync_history(repo: dict, server: dict, opts: dict):
     cfg = load_config()
@@ -650,20 +737,91 @@ def api_get_config():
             repo["browser_opts"] = get_repo_browser_options(repo)
     return jsonify(cfg)
 
+
+def _server_from_request(data: dict, existing=None) -> dict:
+    server = dict(existing or {})
+    server["name"] = str(data.get("name", server.get("name", ""))).strip()
+    server["host"] = str(data.get("host", server.get("host", ""))).strip()
+    server["user"] = str(data.get("user", server.get("user", "root"))).strip() or "root"
+    try:
+        server["port"] = int(data.get("port", server.get("port", 22)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SSH 端口必须是整数") from exc
+    if not 1 <= server["port"] <= 65535:
+        raise ValueError("SSH 端口必须是 1-65535 之间的整数")
+    if not server["name"]:
+        raise ValueError("服务器名称不能为空")
+    if not server["host"]:
+        raise ValueError("主机地址不能为空")
+
+    server["auth_mode"] = data.get("auth_mode", server.get("auth_mode", "key"))
+    if server["auth_mode"] not in {"key", "password"}:
+        raise ValueError("不支持的认证方式")
+    server["key"] = str(data.get("key", server.get("key", ""))).strip() if server["auth_mode"] == "key" else ""
+    password = str(data.get("password", ""))
+    if server["auth_mode"] == "key":
+        server["password_enc"] = ""
+    elif password:
+        server["password_enc"] = _obfuscate(password)
+    elif "password_enc" not in server:
+        server["password_enc"] = ""
+    if server["auth_mode"] == "password" and not server["password_enc"]:
+        raise ValueError("密码模式必须填写 SSH 密码")
+    return server
+
+
+@app.route("/api/servers/test", methods=["POST"])
+def api_test_server():
+    data = request.json or {}
+    cfg = load_config()
+    existing = next((s for s in cfg["servers"] if s["id"] == data.get("server_id")), None)
+    try:
+        server = _server_from_request(data, existing)
+        _run_ssh_check(server)
+        return jsonify({"ok": True, "message": "SSH 连接成功"})
+    except FileNotFoundError as exc:
+        if str(exc) == "sshpass":
+            return jsonify({"error": "本机未安装 sshpass，密码模式需要先安装它"}), 500
+        return jsonify({"error": "本机未安装 ssh"}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "SSH 连接超时，请检查地址、端口和防火墙"}), 504
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/servers/install-key", methods=["POST"])
+def api_install_server_key():
+    data = request.json or {}
+    cfg = load_config()
+    existing = next((s for s in cfg["servers"] if s["id"] == data.get("server_id")), None)
+    try:
+        server = _server_from_request(data, existing)
+        private_key = _resolve_private_key_path(server.get("key", ""))
+        public_key = _read_public_key(private_key)
+        _install_public_key(server, public_key, str(data.get("password", "")))
+        key_server = {**server, "auth_mode": "key", "key": str(private_key)}
+        _run_ssh_check(key_server)
+        return jsonify({"ok": True, "key": str(private_key), "message": "公钥已安装，SSH 密钥连接成功"})
+    except FileNotFoundError as exc:
+        if str(exc) == "sshpass":
+            return jsonify({"error": "本机未安装 sshpass，无法使用密码自动安装公钥"}), 500
+        return jsonify({"error": "本机未安装 ssh 或 sshpass"}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "SSH 连接超时，请检查地址、端口和防火墙"}), 504
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
 @app.route("/api/servers", methods=["POST"])
 def api_add_server():
     cfg = load_config()
-    data = request.json
-    auth_mode = data.get("auth_mode", "key")
+    data = request.json or {}
+    try:
+        server_data = _server_from_request(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     server = {
         "id": str(int(time.time() * 1000)),
-        "name": data["name"],
-        "host": data["host"],
-        "port": data.get("port", 22),
-        "user": data.get("user", "root"),
-        "auth_mode": auth_mode,
-        "key": data.get("key", "") if auth_mode == "key" else "",
-        "password_enc": _obfuscate(data.get("password", "")) if auth_mode == "password" else "",
+        **server_data,
     }
     cfg["servers"].append(server)
     save_config(cfg)
@@ -683,21 +841,13 @@ def api_delete_server(sid):
 @app.route("/api/servers/<sid>", methods=["PUT"])
 def api_edit_server(sid):
     cfg = load_config()
-    data = request.json
-    auth_mode = data.get("auth_mode", "key")
+    data = request.json or {}
     for s in cfg["servers"]:
         if s["id"] == sid:
-            s["name"]      = data["name"]
-            s["host"]      = data["host"]
-            s["port"]      = data.get("port", 22)
-            s["user"]      = data.get("user", "root")
-            s["auth_mode"] = auth_mode
-            s["key"]       = data.get("key", "") if auth_mode == "key" else ""
-            new_pw = data.get("password", "")
-            if auth_mode == "password" and new_pw:
-                s["password_enc"] = _obfuscate(new_pw)
-            elif auth_mode == "key":
-                s["password_enc"] = ""
+            try:
+                s.update(_server_from_request(data, s))
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
             break
     save_config(cfg)
     return jsonify({"ok": True})
@@ -1556,7 +1706,12 @@ tr:last-child td { border-bottom: none; }
         </select>
       </div>
     </div>
-    <div id="ns-key-group" class="form-row"><div class="field"><label>SSH 密钥路径（留空使用默认）</label><input id="ns-key" placeholder="~/.ssh/id_rsa" type="text"></div></div>
+    <div id="ns-key-group" class="form-row"><div class="field">
+      <label>SSH 密钥路径（留空使用默认）</label><input id="ns-key" placeholder="~/.ssh/id_rsa" type="text">
+      <label style="margin-top:10px;">首次安装公钥的登录密码（不保存）</label>
+      <input id="ns-key-password" placeholder="可选：自动回传公钥到 authorized_keys" type="password">
+      <div style="font-size:10px;color:var(--text3);margin-top:5px;">填写后，添加服务器前会用该密码登录一次并自动安装公钥；密码不会写入配置。</div>
+    </div></div>
     <div id="ns-pass-group" class="form-row" style="display:none;"><div class="field">
       <label>SSH 密码</label>
       <div style="position:relative;">
@@ -1567,6 +1722,7 @@ tr:last-child td { border-bottom: none; }
     </div></div>
     <div class="modal-footer">
       <button class="btn" onclick="closeModal('modal-add-server')">取消</button>
+      <button class="btn" onclick="testNewServer()">测试连接</button>
       <button class="btn btn-green" onclick="addServer()">添加</button>
     </div>
   </div>
@@ -2642,22 +2798,59 @@ function togglePassVis() {
 }
 
 // Servers / Repos CRUD
-async function addServer() {
-  const name = document.getElementById('ns-name').value.trim();
-  const host = document.getElementById('ns-host').value.trim();
-  if (!name || !host) return alert('名称和主机地址不能为空');
-  const auth_mode = document.getElementById('ns-auth').value;
-  const payload = {
-    name, host,
-    port: parseInt(document.getElementById('ns-port').value) || 22,
-    user: document.getElementById('ns-user').value.trim() || 'root',
+function collectServerPayload(prefix, serverId = '') {
+  const auth_mode = document.getElementById(`${prefix}-auth`).value;
+  return {
+    server_id: serverId || undefined,
+    name: document.getElementById(`${prefix}-name`).value.trim(),
+    host: document.getElementById(`${prefix}-host`).value.trim(),
+    port: parseInt(document.getElementById(`${prefix}-port`).value, 10) || 22,
+    user: document.getElementById(`${prefix}-user`).value.trim() || 'root',
     auth_mode,
-    key: auth_mode === 'key' ? document.getElementById('ns-key').value.trim() : '',
-    password: auth_mode === 'password' ? document.getElementById('ns-password').value : '',
+    key: auth_mode === 'key' ? document.getElementById(`${prefix}-key`).value.trim() : '',
+    password: auth_mode === 'password' ? document.getElementById(`${prefix}-password`).value : '',
   };
+}
+
+async function ensureServerConnection(payload, bootstrapPassword = '') {
+  if (payload.auth_mode === 'key' && bootstrapPassword) {
+    const installResult = await api('POST', '/api/servers/install-key', {
+      ...payload,
+      password: bootstrapPassword,
+    });
+    if (installResult.error) return installResult;
+    if (installResult.key) payload.key = installResult.key;
+    return installResult;
+  }
+  return api('POST', '/api/servers/test', payload);
+}
+
+async function testNewServer() {
+  const payload = collectServerPayload('ns');
+  if (!payload.name || !payload.host) return alert('名称和主机地址不能为空');
+  const result = await ensureServerConnection(
+    payload,
+    document.getElementById('ns-auth').value === 'key'
+      ? document.getElementById('ns-key-password').value
+      : '',
+  );
+  if (result.error) return alert(`连接失败：${result.error}`);
+  if (payload.key) document.getElementById('ns-key').value = payload.key;
+  document.getElementById('ns-key-password').value = '';
+  alert(result.message || 'SSH 连接成功');
+}
+
+async function addServer() {
+  const payload = collectServerPayload('ns');
+  if (!payload.name || !payload.host) return alert('名称和主机地址不能为空');
+  const result = await ensureServerConnection(
+    payload,
+    payload.auth_mode === 'key' ? document.getElementById('ns-key-password').value : '',
+  );
+  if (result.error) return alert(`连接失败，未添加服务器：${result.error}`);
   await api('POST', '/api/servers', payload);
   closeModal('modal-add-server');
-  ['ns-name','ns-host','ns-port','ns-user','ns-key','ns-password'].forEach(id => document.getElementById(id).value = '');
+  ['ns-name','ns-host','ns-port','ns-user','ns-key','ns-password','ns-key-password'].forEach(id => document.getElementById(id).value = '');
   document.getElementById('ns-auth').value = 'key';
   toggleAuthMode();
   await loadAll();
@@ -3127,24 +3320,35 @@ function openEditServer(id) {
   document.getElementById('es-auth').value = s.auth_mode || 'key';
   document.getElementById('es-key').value  = s.key || '';
   document.getElementById('es-password').value = '';
+  document.getElementById('es-key-password').value = '';
   toggleEditAuthMode();
   openModal('modal-edit-server');
 }
 
+async function testEditServer() {
+  const id = document.getElementById('es-id').value;
+  const payload = collectServerPayload('es', id);
+  if (!payload.name || !payload.host) return alert('名称和主机地址不能为空');
+  const result = await ensureServerConnection(
+    payload,
+    payload.auth_mode === 'key' ? document.getElementById('es-key-password').value : '',
+  );
+  if (result.error) return alert(`连接失败：${result.error}`);
+  if (payload.key) document.getElementById('es-key').value = payload.key;
+  document.getElementById('es-key-password').value = '';
+  alert(result.message || 'SSH 连接成功');
+}
+
 async function saveServer() {
-  const id   = document.getElementById('es-id').value;
-  const name = document.getElementById('es-name').value.trim();
-  const host = document.getElementById('es-host').value.trim();
-  if (!name || !host) return alert('名称和主机地址不能为空');
-  const auth_mode = document.getElementById('es-auth').value;
-  await api('PUT', `/api/servers/${id}`, {
-    name, host,
-    port: parseInt(document.getElementById('es-port').value) || 22,
-    user: document.getElementById('es-user').value.trim() || 'root',
-    auth_mode,
-    key:      auth_mode === 'key'      ? document.getElementById('es-key').value.trim() : '',
-    password: auth_mode === 'password' ? document.getElementById('es-password').value   : '',
-  });
+  const id = document.getElementById('es-id').value;
+  const payload = collectServerPayload('es', id);
+  if (!payload.name || !payload.host) return alert('名称和主机地址不能为空');
+  const result = await ensureServerConnection(
+    payload,
+    payload.auth_mode === 'key' ? document.getElementById('es-key-password').value : '',
+  );
+  if (result.error) return alert(`连接失败，未保存服务器：${result.error}`);
+  await api('PUT', `/api/servers/${id}`, payload);
   closeModal('modal-edit-server');
   await loadAll();
 }
@@ -3172,7 +3376,12 @@ loadAll();
         </select>
       </div>
     </div>
-    <div id="es-key-group" class="form-row"><div class="field"><label>SSH 密钥路径</label><input id="es-key" type="text" placeholder="~/.ssh/id_rsa"></div></div>
+    <div id="es-key-group" class="form-row"><div class="field">
+      <label>SSH 密钥路径</label><input id="es-key" type="text" placeholder="~/.ssh/id_rsa">
+      <label style="margin-top:10px;">首次安装公钥的登录密码（不保存）</label>
+      <input id="es-key-password" placeholder="可选：自动回传公钥到 authorized_keys" type="password">
+      <div style="font-size:10px;color:var(--text3);margin-top:5px;">仅用于本次自动安装公钥，不会覆盖已保存的认证方式。</div>
+    </div></div>
     <div id="es-pass-group" class="form-row" style="display:none;"><div class="field">
       <label>新密码（留空保持不变）</label>
       <div style="position:relative;">
@@ -3182,6 +3391,7 @@ loadAll();
     </div></div>
     <div class="modal-footer">
       <button class="btn" onclick="closeModal('modal-edit-server')">取消</button>
+      <button class="btn" onclick="testEditServer()">测试连接</button>
       <button class="btn btn-green" onclick="saveServer()">保存</button>
     </div>
   </div>
