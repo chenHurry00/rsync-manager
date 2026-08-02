@@ -334,15 +334,23 @@ def _resolve_private_key_path(raw_key: str) -> Path:
     candidates = []
     if raw_key.strip():
         candidates.append(Path(raw_key).expanduser())
-    else:
-        candidates.extend(
-            Path.home() / name
-            for name in (".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa")
-        )
+    ssh_dir = Path.home() / ".ssh"
+    candidates.extend(
+        ssh_dir / name
+        for name in ("id_ed25519", "id_ecdsa", "id_rsa")
+    )
+    if ssh_dir.is_dir():
+        candidates.extend(public_key.with_suffix("") for public_key in sorted(ssh_dir.glob("*.pub")))
+
+    seen = set()
     for candidate in candidates:
+        candidate = candidate.resolve(strict=False)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         if candidate.is_file():
             return candidate
-    raise ValueError("找不到 SSH 私钥，请填写私钥路径")
+    raise ValueError("找不到可用 SSH 私钥；已自动搜索 ~/.ssh 下带 .pub 文件的密钥")
 
 
 def _read_public_key(private_key: Path) -> str:
@@ -1717,7 +1725,7 @@ tr:last-child td { border-bottom: none; }
       </div>
     </div>
     <div id="ns-key-group" class="form-row"><div class="field">
-      <label>SSH 密钥路径（留空使用默认）</label><input id="ns-key" placeholder="~/.ssh/id_rsa" type="text">
+      <label>SSH 密钥路径（留空自动检测）</label><input id="ns-key" placeholder="自动查找 ~/.ssh 下的密钥" type="text">
       <label style="margin-top:10px;">首次安装公钥的登录密码（不保存）</label>
       <input id="ns-key-password" placeholder="可选：自动回传公钥到 authorized_keys" type="password">
       <div style="font-size:10px;color:var(--text3);margin-top:5px;">填写后，添加服务器前会用该密码登录一次并自动安装公钥；密码不会写入配置。</div>
@@ -3387,7 +3395,7 @@ loadAll();
       </div>
     </div>
     <div id="es-key-group" class="form-row"><div class="field">
-      <label>SSH 密钥路径</label><input id="es-key" type="text" placeholder="~/.ssh/id_rsa">
+      <label>SSH 密钥路径（留空自动检测）</label><input id="es-key" type="text" placeholder="自动查找 ~/.ssh 下的密钥">
       <label style="margin-top:10px;">首次安装公钥的登录密码（不保存）</label>
       <input id="es-key-password" placeholder="可选：自动回传公钥到 authorized_keys" type="password">
       <div style="font-size:10px;color:var(--text3);margin-top:5px;">仅用于本次自动安装公钥，不会覆盖已保存的认证方式。</div>
