@@ -27,7 +27,7 @@ CODESYNC_PORT=8899 python3 app.py
 
 ## systemd 服务管理（Linux）
 
-仓库提供 `scripts/codesync-service.sh`，可自动创建项目内 `.venv`、安装依赖并注册 systemd 服务。直接运行脚本会进入交互式 TUI 菜单，也可以传入命令执行。首次安装需要当前用户具备 `sudo` 权限，以及 `python3-venv` 和 `rsync`；脚本会在 Debian/Ubuntu、Fedora/RHEL 和 Arch Linux 上自动安装 `sshpass`。请直接以当前用户执行脚本，脚本会在需要时调用 `sudo`：
+仓库提供 `scripts/codesync-service.sh`，可自动创建项目内 `.venv`、安装依赖并注册 systemd 服务。重复执行 `install` 会覆盖 unit 文件并重启服务，确保加载最新代码。直接运行脚本会进入交互式 TUI 菜单，也可以传入命令执行。首次安装需要当前用户具备 `sudo` 权限，以及 `python3-venv` 和 `rsync`；脚本会在 Debian/Ubuntu、Fedora/RHEL 和 Arch Linux 上自动安装 `sshpass`。请直接以当前用户执行脚本，脚本会在需要时调用 `sudo`：
 
 ```bash
 # 一键创建环境、安装依赖、注册并启动服务

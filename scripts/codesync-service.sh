@@ -305,13 +305,14 @@ install_service() {
   validate_port "${SERVICE_PORT}"
   write_unit_file
 
-  log "注册并启动服务：${SERVICE_NAME}"
+  log "注册并重启服务：${SERVICE_NAME}"
   run_root systemctl daemon-reload
-  if ! run_root systemctl enable --now "${SERVICE_NAME}.service"; then
-    log "服务启动失败，请选择“查看服务状态和最近日志”获取详情"
+  run_root systemctl enable "${SERVICE_NAME}.service"
+  if ! run_root systemctl restart "${SERVICE_NAME}.service"; then
+    log "服务重启失败，请选择“查看服务状态和最近日志”获取详情"
     return 1
   fi
-  log "服务已启动：http://localhost:${SERVICE_PORT}"
+  log "服务已重启：http://localhost:${SERVICE_PORT}"
 }
 
 status_service() {
