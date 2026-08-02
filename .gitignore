@@ -1,3 +1,4 @@
+# Python runtime and test artifacts
 __pycache__/
 *.py[cod]
 .venv/
@@ -5,7 +6,26 @@ venv/
 env/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 
+# Local logs and environment files
+*.log
+.env
+.env.local
+.env.*.local
+
+# IDE files
 .vscode/
 .idea/
 .DS_Store
+
+# Local agent and workflow metadata
+/.spec-workflow/
+/.codex/
+/.claude/
+/.agents/

@@ -19,6 +19,42 @@ python3 app.py
 # http://localhost:7788
 ```
 
+Web 端口默认是 `7788`。直接运行应用时，可通过 `CODESYNC_PORT` 覆盖：
+
+```bash
+CODESYNC_PORT=8899 python3 app.py
+```
+
+## systemd 服务管理（Linux）
+
+仓库提供 `scripts/codesync-service.sh`，可自动创建项目内 `.venv`、安装依赖并注册 systemd 服务。直接运行脚本会进入交互式 TUI 菜单，也可以传入命令执行。首次安装需要当前用户具备 `sudo` 权限，以及 `python3-venv` 和 `rsync`；请直接以当前用户执行脚本，脚本会在需要时调用 `sudo`：
+
+```bash
+# 一键创建环境、安装依赖、注册并启动服务
+./scripts/codesync-service.sh install
+
+# 进入 TUI 菜单（推荐）
+./scripts/codesync-service.sh
+
+# 查看服务状态和最近 30 条日志
+./scripts/codesync-service.sh status
+
+# 重启 / 停止服务
+./scripts/codesync-service.sh restart
+./scripts/codesync-service.sh stop
+
+# 卸载 systemd 服务（不会删除 .venv 或 ~/.codesync 配置）
+./scripts/codesync-service.sh uninstall
+```
+
+服务默认名称为 `codesync`，默认监听 `http://localhost:7788`。TUI 执行安装时会询问 Web 端口，直接回车保留默认值；输入新端口后会写入 systemd 服务，后续重启仍会使用该端口。也可以通过环境变量设置：
+
+```bash
+CODESYNC_PORT=8899 ./scripts/codesync-service.sh install
+```
+
+如需更换服务名，可设置 `CODESYNC_SERVICE_NAME`。TUI 中使用方向键或 `j/k` 移动，按 Enter 执行，按 `q` 退出；卸载操作会再次确认。
+
 ## 功能
 
 - **多服务器管理** — 保存多台服务器的 SSH 配置（IP、端口、用户名、密钥路径）

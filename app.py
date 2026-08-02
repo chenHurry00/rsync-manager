@@ -4,7 +4,7 @@ from __future__ import annotations
 """
 CodeSync - Python Web UI for rsync-based code repository synchronization
 Run: python app.py
-Then open: http://localhost:7788
+Then open: http://localhost:7788, or set CODESYNC_PORT to use another port.
 """
 
 import base64
@@ -32,6 +32,22 @@ def _deobfuscate(s: str) -> str:
         return s  # already plaintext (legacy)
 
 app = Flask(__name__)
+
+DEFAULT_PORT = 7788
+
+
+def _listen_port() -> int:
+    raw_port = os.environ.get("CODESYNC_PORT", "").strip() or str(DEFAULT_PORT)
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise ValueError("CODESYNC_PORT 必须是 1-65535 之间的整数") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("CODESYNC_PORT 必须是 1-65535 之间的整数")
+    return port
+
+
+LISTEN_PORT = _listen_port()
 
 # ── Config persistence ────────────────────────────────────────────────────────
 CONFIG_FILE = Path.home() / ".codesync" / "config.json"
@@ -1985,6 +2001,9 @@ function handleSyncTargetChange(forceReload = false) {
   }
   if (server && (forceReload || remoteTargetChanged)) {
     loadRemoteBrowser('');
+  } else if (server && anyTargetChanged) {
+    // Also reload if remote root changed even when repoId/serverId unchanged
+    loadRemoteBrowser('');
   }
 
   if (anyTargetChanged && repo) {
@@ -3219,6 +3238,8 @@ loadAll();
 </body>
 </html>"""
 
+HTML = HTML.replace("localhost:7788", f"localhost:{LISTEN_PORT}")
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -3226,7 +3247,7 @@ def index():
 if __name__ == "__main__":
     print("=" * 50)
     print("  CodeSync — Web UI for rsync sync manager")
-    print("  Open: http://localhost:7788")
+    print(f"  Open: http://localhost:{LISTEN_PORT}")
     print("  Config saved to: ~/.codesync/config.json")
     print("=" * 50)
-    app.run(host="0.0.0.0", port=7788, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=LISTEN_PORT, debug=False, threaded=True)
