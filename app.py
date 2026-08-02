@@ -1228,6 +1228,7 @@ HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Syne:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 :root {
+  color-scheme: dark;
   --bg: #0d0f0e;
   --bg2: #141614;
   --bg3: #1a1d1a;
@@ -1331,6 +1332,15 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   outline: none; transition: border 0.15s;
 }
 .field input:focus, .field select:focus, .field textarea:focus { border-color: var(--green); }
+.field input:-webkit-autofill,
+.field input:-webkit-autofill:hover,
+.field input:-webkit-autofill:focus,
+.field input:-webkit-autofill:active {
+  -webkit-text-fill-color: var(--text);
+  -webkit-box-shadow: 0 0 0 1000px var(--bg3) inset;
+  box-shadow: 0 0 0 1000px var(--bg3) inset;
+  caret-color: var(--text);
+}
 .field textarea { resize: vertical; min-height: 60px; }
 .field select option { background: var(--bg2); }
 .field-help { font-size: 10px; color: var(--text3); margin-top: 6px; font-family: var(--mono); line-height: 1.6; }
